@@ -1,15 +1,8 @@
-#!/usr/bin/env python3
-"""
-Simple assistant to register applications in apps.json
-Usage:
-  python register_apps.py add "name" "exec"
-  python register_apps.py list
-  python register_apps.py remove "name"
-"""
 from pathlib import Path
 import json
-import argparse
 import sys
+import types
+import subprocess
 
 APPS_PATH = Path("./apps.json")
 
@@ -73,34 +66,27 @@ def cmd_remove(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Register apps in apps.json")
-    sub = parser.add_subparsers(dest="command")
-    p_add = sub.add_parser("add", help="Add a new app")
-    p_add.add_argument("name", help="Application name")
-    p_add.add_argument("exec", help="Executable path or URL")
-    p_add.set_defaults(func=cmd_add)
-
-    p_list = sub.add_parser("list", help="List registered apps")
-    p_list.set_defaults(func=cmd_list)
-
-    p_remove = sub.add_parser("remove", help="Remove an app by name")
-    p_remove.add_argument("name", help="Application name to remove")
-    p_remove.set_defaults(func=cmd_remove)
-
-    args = parser.parse_args()
-    if not args.command:
-        name = input("Nome do app: ").strip()
-        if not name:
-            parser.print_help()
-            return sys.exit(1)
-        exec_path = input("Exec (path ou URL): ").strip()
-        if not exec_path:
-            print("Exec vazio.")
-            return sys.exit(1)
-        ns = argparse.Namespace(name=name, exec=exec_path)
-        return sys.exit(cmd_add(ns))
-
-    sys.exit(args.func(args))
+    try:
+        while True:
+            name = input("Nome do app (ou 'exit' para sair): ").strip()
+            if not name:
+                print("Nome vazio.")
+                continue
+            if name.lower() in ("exit", "quit", "sair"):
+                print("Encerrando.")
+                return
+            exec_path = input("Exec (path ou URL): ").strip()
+            # remove aspas simples ou duplas no começo/fim
+            exec_path = exec_path.strip('"\'')
+            if not exec_path:
+                print("Exec vazio.")
+                continue
+            ns = types.SimpleNamespace()
+            setattr(ns, "name", name)
+            setattr(ns, "exec", exec_path)
+            cmd_add(ns)
+    except KeyboardInterrupt:
+        print("\nEncerrado.")
 
 
 if __name__ == "__main__":

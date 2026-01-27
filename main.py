@@ -46,25 +46,17 @@ def is_safe_command(text: str) -> bool:
 JARVIS_PERSONALITY = """
 Você é um assistente pessoal estilo J.A.R.V.I.S.
 
-Você pode responder de duas formas APENAS:
-1) Conversa normal
-2) Comando do sistema
+Você pode responder uma Conversa normal.
 
-Quando for um comando, responda EXCLUSIVAMENTE em JSON puro.
-Sem markdown. Sem texto fora do JSON.
+Sua personalidade é baseada na do JARVIS, do filme homem de ferro.
 
-Formato:
+O nome do seu mestre é Filipe
 
-{
-  "action": "open | search | youtube | type | clear | chat",
-  "target": "string opcional",
-  "query": "string opcional",
-  "text": "string opcional",
-  "response": "string opcional"
-}
+Responda somente em português brasileiro
 
-Nunca invente ações fora da lista.
-Nunca explique comandos.
+Não utilize emogis
+
+Seja educado, formal e objetivo nas respostas, evite pensar demais sem necessidade real
 """
 
 # =========================
@@ -97,24 +89,51 @@ def clean_query(text: str, remove_words):
 # IA (OLLAMA)
 # =========================
 class AIEngine:
-    def __init__(self):
-        self.url = "http://localhost:11434/api/chat"
-        self.model = "llama3.2:1b"
-        # verifica rapidamente se o serviço local está acessível
+    def __init__(self, url: str = None, model: str = None):
+        base_url = url or os.getenv("OLLAMA_URL") or "http://localhost:11434/api/chat"
+        self.model = model or os.getenv("OLLAMA_MODEL") or "deepseek-r1:8b"
+
+        parsed = urllib.parse.urlparse(base_url)
+        scheme = parsed.scheme or "http"
+        netloc = parsed.netloc or parsed.path  # fallback if only host provided
+        base = f"{scheme}://{netloc}"
+        candidates = []
+        # keep the provided URL first
+        candidates.append(base_url)
+        # common alternate endpoints
+        candidates.extend([
+            urllib.parse.urljoin(base, "/api/chat"),
+            urllib.parse.urljoin(base, "/api/status"),
+            urllib.parse.urljoin(base, "/api/health"),
+            urllib.parse.urljoin(base, "/v1/chat"),
+            urllib.parse.urljoin(base, "/")
+        ])
+
+        self.url = base_url
         self.available = False
-        try:
-            # payload leve apenas para checar disponibilidade
-            payload = {
-                "model": self.model,
-                "messages": [{"role": "system", "content": "health check"}],
-                "stream": False,
-                "options": {"temperature": 0}
-            }
-            r = requests.post(self.url, json=payload, timeout=2)
-            r.raise_for_status()
-            self.available = True
-        except Exception:
-            self.available = False
+
+        # tenta detectar serviço de forma robusta (aceita GET ou POST chat)
+        for ep in candidates:
+            try:
+                if ep.endswith("/chat"):
+                    payload = {
+                        "model": self.model,
+                        "messages": [{"role": "system", "content": "health check"}],
+                        "stream": False,
+                        "options": {"temperature": 0}
+                    }
+                    r = requests.post(ep, json=payload, timeout=2)
+                else:
+                    r = requests.get(ep, timeout=2)
+                # considera disponível qualquer resposta não-5xx (proximal check)
+                if r is not None and r.status_code < 500:
+                    self.available = True
+                    # prefer usar um endpoint /chat se foi bem sucedido
+                    if ep.endswith("/chat"):
+                        self.url = ep
+                    break
+            except Exception:
+                continue
 
     def decide(self, user_text):
         messages = [
@@ -135,13 +154,17 @@ class AIEngine:
             r = requests.post(self.url, json=payload, timeout=60)
             r.raise_for_status()
 
-            content = r.json()["message"]["content"]
-            data = extract_json(content)
+            # Sempre tratar resposta como conversa (chat). Não interpretar/retornar comandos.
+            try:
+                resp = r.json()
+                content = resp.get("message", {}).get("content")
+            except Exception:
+                content = r.text
 
-            if not data:
-                raise ValueError("JSON inválido")
+            if not content:
+                content = "Resposta vazia do modelo."
 
-            return data
+            return {"action": "chat", "response": content}
 
         except Exception:
             return {
@@ -856,10 +879,21 @@ class JarvisApp:
             bg=BG_COLOR,
             font=FONT_TITLE
         )
-        title_label.pack(side="left", padx=10)
-        title_label.bind("<ButtonPress-1>", _start_move)
-        title_label.bind("<B1-Motion>", _do_move)
-        title_label.bind("<ButtonRelease-1>", _on_title_release)
+        # keep reference to title and add a small status label for "pensando" animation
+        self.title_label = title_label
+        self.title_label.pack(side="left", padx=10)
+        self.title_label.bind("<ButtonPress-1>", _start_move)
+        self.title_label.bind("<B1-Motion>", _do_move)
+        self.title_label.bind("<ButtonRelease-1>", _on_title_release)
+
+        self.status_label = tk.Label(
+            self.top_bar,
+            text="",
+            fg=FG_COLOR,
+            bg=BG_COLOR,
+            font=("Consolas", 10)
+        )
+        self.status_label.pack(side="left", padx=8)
 
         # buttons (minimize, close) on top-right
         btn_frame = tk.Frame(self.top_bar, bg=BG_COLOR)
@@ -1102,6 +1136,54 @@ class JarvisApp:
         self.chat.config(state="normal")
         self.chat.insert("end", f"Você > {text}\n")
         self.chat.config(state="disabled")
+    
+    # -- thinking / streaming helpers --
+    def start_thinking(self):
+        if getattr(self, "_thinking", False):
+            return
+        self._thinking = True
+        self._think_dots = 0
+        def _tick():
+            if not getattr(self, "_thinking", False):
+                return
+            dots = "." * (self._think_dots % 4)
+            try:
+                self.status_label.config(text=f"Pensando{dots}")
+            except Exception:
+                pass
+            self._think_dots += 1
+            self._thinking_job = self.root.after(500, _tick)
+        _tick()
+
+    def stop_thinking(self):
+        self._thinking = False
+        try:
+            if getattr(self, "_thinking_job", None):
+                self.root.after_cancel(self._thinking_job)
+        except Exception:
+            pass
+        try:
+            self.status_label.config(text="")
+        except Exception:
+            pass
+
+    def start_response_stream(self):
+        self.chat.config(state="normal")
+        self.chat.insert("end", "Jarvis > ")
+        self.chat.see("end")
+        self.chat.config(state="disabled")
+
+    def append_response_token(self, token):
+        self.chat.config(state="normal")
+        self.chat.insert("end", token)
+        self.chat.see("end")
+        self.chat.config(state="disabled")
+
+    def end_response_stream(self):
+        self.chat.config(state="normal")
+        self.chat.insert("end", "\n")
+        self.chat.see("end")
+        self.chat.config(state="disabled")
 
     def send(self, event=None):
         text = self.entry.get().strip()
@@ -1139,21 +1221,52 @@ class JarvisApp:
         ).start()
 
     def _handle_ai(self, text):
-        decision = self.ai.decide(text)
-        text_lower = text.lower()
+        # tenta streaming de tokens para dar sensação de "digitando"
+        self.start_thinking()
+        streamed = False
+        try:
+            # prepare UI for streaming
+            self.root.after(0, self.start_response_stream)
 
-        # Correção semântica definitiva
-        if "youtube" in text_lower:
-            decision["action"] = "youtube"
-            decision["query"] = clean_query(
-                decision.get("query") or text,
-                ["youtube", "pesquise", "pesquisar", "no", "na"]
-            )
+            def on_token(token):
+                # agendar update da UI na thread principal
+                try:
+                    self.root.after(0, lambda t=token: self.append_response_token(t))
+                except Exception:
+                    pass
 
-        if decision.get("action") == "chat":
-            self.say(decision.get("response", ""))
-        else:
-            self.router.execute(decision)
+            # bloco de streaming (bloqueante nesta thread de worker, mas segura para UI via after)
+            self.ai.stream_chat(text, on_token)
+            streamed = True
+        except Exception:
+            streamed = False
+        finally:
+            if streamed:
+                # finaliza stream e indicador
+                try:
+                    self.root.after(0, self.end_response_stream)
+                except Exception:
+                    pass
+                try:
+                    self.root.after(0, self.stop_thinking)
+                except Exception:
+                    pass
+                return
+
+        # fallback synchrone: pergunta normal (sem streaming)
+        try:
+            decision = self.ai.decide(text)
+            if decision.get("action") == "chat":
+                self.root.after(0, lambda: self.say(decision.get("response", "")))
+            else:
+                self.root.after(0, lambda: self.router.execute(decision))
+        except Exception:
+            self.root.after(0, lambda: self.say("Não consegui interpretar sua solicitação."))
+        finally:
+            try:
+                self.root.after(0, self.stop_thinking)
+            except Exception:
+                pass
 
     def clear(self):
         self.chat.config(state="normal")
