@@ -22,6 +22,26 @@ except Exception:
     PYSTRAY_AVAILABLE = False
 
 # =========================
+# IMPORTAÇÕES PARA VOZ
+# =========================
+try:
+    import sounddevice as sd
+    import numpy as np
+    from scipy.io.wavfile import write
+    import whisper
+    import tempfile
+    import keyboard
+    VOICE_AVAILABLE = True
+except Exception:
+    sd = None
+    np = None
+    write = None
+    whisper = None
+    tempfile = None
+    keyboard = None
+    VOICE_AVAILABLE = False
+
+# =========================
 # CONFIG
 # =========================
 APP_NAME = "J.A.R.V.I.S"
@@ -58,6 +78,237 @@ Não utilize emogis
 
 Seja educado, formal e objetivo nas respostas, evite pensar demais sem necessidade real
 """
+
+# =========================
+# SISTEMA DE VOZ
+# =========================
+class VoiceSystem:
+    def __init__(self, jarvis_app):
+        self.jarvis = jarvis_app
+        self.is_recording = False
+        self.frames = []
+        self.stream = None
+        self.model = None
+        
+        # Configurações de gravação
+        self.sample_rate = 16000
+        self.channels = 1
+        self.blocksize = 1024
+        
+        # Configurações de detecção de silêncio
+        self.silence_threshold = 0.01
+        self.silence_duration = 1.5
+        self.min_recording_time = 0.5
+        
+        # Controle de silêncio
+        self.last_sound_time = None
+        self.silence_counter = 0
+        
+        # Carregar modelo whisper em thread separada
+        self.model_loaded = False
+        self.loading_thread = None
+        
+        if VOICE_AVAILABLE:
+            self.setup_voice()
+    
+    def setup_voice(self):
+        """Configura o sistema de voz"""
+        try:
+            # Inicia carregamento do modelo em thread separada
+            self.loading_thread = threading.Thread(target=self.load_model, daemon=True)
+            self.loading_thread.start()
+            
+            # Configura hotkey
+            keyboard.add_hotkey('ctrl+alt+v', self.toggle_recording)
+            
+            print("Sistema de voz inicializado. Pressione CTRL+ALT+V para falar.")
+        except Exception as e:
+            print(f"Erro ao configurar sistema de voz: {e}")
+    
+    def load_model(self):
+        """Carrega o modelo whisper"""
+        try:
+            print("🧠 Carregando modelo de voz...")
+            self.model = whisper.load_model("small")
+            self.model_loaded = True
+            print("Modelo de voz carregado com sucesso!")
+        except Exception as e:
+            print(f"Erro ao carregar modelo de voz: {e}")
+            self.model_loaded = False
+    
+    def toggle_recording(self):
+        """Alterna entre iniciar e parar gravação"""
+        if not self.is_recording:
+            self.start_recording()
+        else:
+            self.stop_recording()
+    
+    def start_recording(self):
+        """Inicia a gravação do áudio"""
+        if self.is_recording:
+            return
+            
+        if not self.model_loaded and VOICE_AVAILABLE:
+            # Tenta carregar modelo se ainda não estiver carregado
+            self.load_model()
+            if not self.model_loaded:
+                self.jarvis.say("Modelo de voz ainda não carregado. Aguarde...")
+                return
+        
+        # Restaura janela se estiver minimizada e reativa IA se necessário
+        self.jarvis.restore_and_activate_ai()
+        
+        # Inicia gravação
+        self.is_recording = True
+        self.frames = []
+        self.last_sound_time = time.time()
+        self.silence_counter = 0
+        
+        try:
+            self.stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype='float32',
+                blocksize=self.blocksize,
+                callback=self.audio_callback
+            )
+            self.stream.start()
+            
+            # Inicia thread para verificar silêncio
+            self.silence_thread = threading.Thread(target=self.check_silence, daemon=True)
+            self.silence_thread.start()
+            
+            # Feedback visual
+            self.jarvis.root.after(0, self.jarvis.show_recording_status, True)
+            
+        except Exception as e:
+            self.jarvis.say(f"Erro ao iniciar gravação: {e}")
+            self.is_recording = False
+    
+    def audio_callback(self, indata, frames, time_info, status):
+        """Callback para processar dados de áudio"""
+        if status:
+            print(f"Status da gravação: {status}")
+        
+        # Adiciona os dados ao buffer
+        self.frames.append(indata.copy())
+        
+        # Calcula o volume atual (RMS)
+        volume = np.sqrt(np.mean(indata**2))
+        
+        # Atualiza o tempo do último som ouvido
+        if volume > self.silence_threshold:
+            self.last_sound_time = time.time()
+            self.silence_counter = 0
+        else:
+            self.silence_counter += 1
+    
+    def check_silence(self):
+        """Verifica continuamente se houve silêncio prolongado"""
+        while self.is_recording:
+            if self.last_sound_time and len(self.frames) > 0:
+                # Calcula tempo desde o último som
+                time_since_sound = time.time() - self.last_sound_time
+                
+                # Calcula duração atual da gravação
+                current_duration = len(self.frames) * self.blocksize / self.sample_rate
+                
+                # Condições para parar:
+                # 1. Silêncio prolongado E gravação tem duração mínima
+                # 2. Ou tempo máximo de segurança (30 segundos)
+                if (time_since_sound > self.silence_duration and 
+                    current_duration > self.min_recording_time):
+                    self.stop_recording()
+                    break
+                elif current_duration > 30:  # Segurança: máximo 30 segundos
+                    self.stop_recording()
+                    break
+            
+            time.sleep(0.1)
+    
+    def stop_recording(self):
+        """Para a gravação e processa o áudio"""
+        if not self.is_recording:
+            return
+            
+        self.is_recording = False
+        
+        # Para e fecha o stream
+        if self.stream:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+        
+        # Aguarda um pouco para garantir que tudo parou
+        time.sleep(0.1)
+        
+        # Remove feedback visual
+        self.jarvis.root.after(0, self.jarvis.show_recording_status, False)
+        
+        # Processa o áudio se houver dados suficientes
+        if self.frames and len(self.frames) > 10:
+            threading.Thread(target=self.process_audio, daemon=True).start()
+        else:
+            self.jarvis.say("Áudio muito curto ou nenhum áudio gravado")
+    
+    def process_audio(self):
+        """Processa o áudio gravado e transcreve"""
+        try:
+            # Combina todos os frames
+            audio_data = np.concatenate(self.frames, axis=0)
+            
+            # Calcula duração
+            duration = len(audio_data) / self.sample_rate
+            print(f"⏱️  Duração do áudio: {duration:.2f} segundos")
+            
+            # Verifica se há áudio válido
+            if duration < self.min_recording_time:
+                self.jarvis.say(f"Áudio muito curto ({duration:.2f}s)")
+                return
+            
+            # Normaliza o áudio
+            max_val = np.max(np.abs(audio_data))
+            if max_val > 0:
+                audio_data = audio_data / max_val
+            else:
+                self.jarvis.say("Áudio muito silencioso, fale mais alto")
+                return
+            
+            # Cria arquivo temporário
+            temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            temp_filename = temp_file.name
+            temp_file.close()
+            
+            # Salva o áudio
+            write(temp_filename, self.sample_rate, (audio_data * 32767).astype(np.int16))
+
+            # Transcreve
+            result = self.model.transcribe(
+                temp_filename,
+                language="pt",
+                fp16=False,
+                task="transcribe"
+            )
+            
+            texto = result["text"].strip()
+            # REMOVER apenas ! ? , mantendo acentos
+            texto = re.sub(r'[!,]', '', texto)
+            
+            # Remove arquivo temporário
+            try:
+                os.unlink(temp_filename)
+            except:
+                pass
+            
+            # Envia texto para o chat
+            if texto:
+                self.jarvis.root.after(0, self.jarvis.process_voice_input, texto)
+            else:
+                self.jarvis.say("Não foi possível transcrever o áudio")
+            
+        except Exception as e:
+            print(f"Erro ao processar áudio: {e}")
+            self.jarvis.say("Erro ao processar áudio")
 
 # =========================
 # UTIL
@@ -215,6 +466,11 @@ class CommandRouter:
         orig = text[1:].strip()
         cmd = orig.lower()
 
+        # Comando para cancelar resposta da IA
+        if cmd in ["cancelar", "parar"]:
+            self.app.cancel_ai_response()
+            return True
+
         if cmd.startswith("abrir ") or cmd.startswith("abra "):
             if cmd.startswith("abrir "):
                 self._open(orig[6:])
@@ -230,11 +486,15 @@ class CommandRouter:
                 self._youtube(orig[8:])
             else:
                 self._youtube(orig[3:])
-        elif cmd.startswith("ytvideo ") or cmd.startswith("ytv "):
+        elif cmd.startswith("ytvideo ") or cmd.startswith("ytv ") or cmd.startswith("vídeo ") or cmd.startswith("o vídeo "):
             if cmd.startswith("ytvideo "):
                 self._ytvideo(orig[8:])
-            else:
+            elif cmd.startswith("ytv "):
                 self._ytvideo(orig[4:])
+            elif cmd.startswith("vídeo "):
+                self._ytvideo(orig[6:])
+            else:
+                self._ytvideo(orig[8:])
         elif cmd.startswith("digitar ") or cmd.startswith("digite "):
             if cmd.startswith("digitar "):
                 self._type(orig[8:])
@@ -281,6 +541,7 @@ class CommandRouter:
                 "  /digitar [texto] - Digita o texto na janela alvo\n"
                 "  /limpar ou /cls - Limpa o chat\n"
                 "  /ytvideo [consulta] - Pesquisa avançada de vídeos no YouTube\n"
+                "  /cancelar ou /parar - Cancela a resposta da IA\n"
                 "  '/' só é necessário caso modelo IA esteja ativo.\n"
             )
         self.app.say(help_text)
@@ -434,10 +695,13 @@ class CommandRouter:
 
         q = query.strip()
         op_mode = False
-        # suporta prefixo -op para abrir direto o primeiro resultado
+        # suporta prefixo para abrir direto o primeiro resultado
         if q.startswith("-op"):
             op_mode = True
             q = q[3:].strip()
+        elif q.startswith("abrir"):
+            op_mode = True
+            q = q[5:].strip()
         if not q:
             self.app.say("Nada para pesquisar no YouTube.")
             return
@@ -569,19 +833,25 @@ class JarvisApp:
     def __init__(self):
         self.ai = AIEngine()
         self.router = CommandRouter(self)
+        
+        # Inicializa sistema de voz
+        self.voice_system = None
+        if VOICE_AVAILABLE:
+            self.voice_system = VoiceSystem(self)
 
-        # Intervalo de checagem de presença (maior quando IA não disponível para economizar CPU)
-        # em hardware fraco preferimos checagens longas para reduzir uso de CPU
+        # Intervalo de checagem de presença
         self._presence_interval = 60 if not self.ai.available else 1
-        # flag que indica que tarefas de background devem ficar pausadas (ex.: quando na bandeja)
         self._paused = False
         self._presence_job = None
+        
+        # Flag para controlar cancelamento da IA
+        self._ai_cancelled = False
+        self._current_ai_thread = None
+        
+        # Flag para controlar se a IA está pensando
+        self._ai_thinking = False
 
-        # log estado inicial da IA
-        try:
-            print(f"[JARVIS][AI] inicializado. available={self.ai.available}")
-        except Exception:
-            pass
+        print(f"[JARVIS][AI] inicializado. available={self.ai.available}")
  
         self.root = tk.Tk()
         self.root.title(APP_NAME)
@@ -590,7 +860,6 @@ class JarvisApp:
 
         # Remove native title bar and provide custom one
         self.root.overrideredirect(True)
-        # enquanto não estiver na bandeja, fica sempre on-top
         try:
             self.root.attributes("-topmost", True)
         except Exception:
@@ -610,23 +879,20 @@ class JarvisApp:
 
         def _restore_from_tray():
             try:
-                # restaura estado do AI
+                # Restaura estado da IA
                 if hasattr(self, "_ai_was_available"):
                     try:
                         self.ai.available = self._ai_was_available
+                        # TENTA RECONECTAR COM O OLLAMA
+                        self._reconnect_ollama()
                     except Exception:
                         pass
-                    delattr = hasattr(self, "_ai_was_available")
-                    if delattr:
-                        try:
-                            del self._ai_was_available
-                        except Exception:
-                            pass
-                # log retorno da bandeja
-                try:
-                    print(f"[JARVIS][AI] retornando da bandeja. available={self.ai.available}")
-                except Exception:
-                    pass
+                    try:
+                        del self._ai_was_available
+                    except Exception:
+                        pass
+                
+                print(f"[JARVIS][AI] retornando da bandeja. available={self.ai.available}")
 
                 try:
                     if hasattr(self, "_tray_icon") and self._tray_icon:
@@ -636,7 +902,6 @@ class JarvisApp:
                             pass
                         self._tray_icon = None
                     self.root.deiconify()
-                    # volta a ficar on-top ao restaurar
                     try:
                         self.root.attributes("-topmost", True)
                     except Exception:
@@ -648,10 +913,9 @@ class JarvisApp:
                         self.entry.focus_set()
                     except Exception:
                         pass
-                    # retoma tarefas de background ao restaurar
+                    # Retoma tarefas de background
                     try:
-                        if hasattr(self, "resume_background_tasks"):
-                            self.resume_background_tasks()
+                        self.resume_background_tasks()
                     except Exception:
                         pass
                 except Exception:
@@ -660,20 +924,17 @@ class JarvisApp:
                 pass
 
         def _minimize_to_tray():
-            # store AI availability and disable while in tray
+            # Salva disponibilidade da IA
             try:
                 self._ai_was_available = getattr(self.ai, "available", False)
-                self.ai.available = False
-                try:
-                    print(f"[JARVIS][AI] indo para a bandeja. previous_available={self._ai_was_available} -> disabled")
-                except Exception:
-                    pass
+                # NÃO DESATIVA A IA COMPLETAMENTE, APENAS MARCA COMO DISPONÍVEL
+                # Isso evita problemas de reconexão
+                print(f"[JARVIS][AI] indo para a bandeja. previous_available={self._ai_was_available}")
             except Exception:
                 pass
 
             # withdraw main window
             try:
-                # desativa on-top quando for bandeja
                 try:
                     self.root.attributes("-topmost", False)
                 except Exception:
@@ -682,7 +943,7 @@ class JarvisApp:
             except Exception:
                 pass
 
-            # pause background activity to reduce CPU while in tray
+            # pause background activity
             try:
                 if hasattr(self, "pause_background_tasks"):
                     self.pause_background_tasks()
@@ -692,11 +953,9 @@ class JarvisApp:
             # start tray icon if available
             if PYSTRAY_AVAILABLE and Image is not None:
                 try:
-                    # simple circular icon using theme color
                     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
                     draw = ImageDraw.Draw(img)
                     draw.ellipse((6, 6, 58, 58), fill=(0, 245, 255, 255))
-                    # make "Restaurar" default action (left click)
                     menu = pystray.Menu(
                         pystray.MenuItem("Restaurar", lambda icon, item: self.root.after(0, _restore_from_tray), default=True),
                         pystray.MenuItem("Sair", lambda icon, item: self.root.after(0, _quit_from_tray))
@@ -704,10 +963,8 @@ class JarvisApp:
                     self._tray_icon = pystray.Icon("jarvis", img, APP_NAME, menu)
                     threading.Thread(target=self._tray_icon.run, daemon=True).start()
                 except Exception:
-                    # fallback: keep window withdrawn (user can restore via taskbar)
                     pass
             else:
-                # fallback: iconify (temporarily disable override to allow iconify)
                 try:
                     self.root.overrideredirect(False)
                     self.root.iconify()
@@ -718,26 +975,22 @@ class JarvisApp:
         def _on_map(event=None):
             try:
                 self.root.overrideredirect(True)
-                # se mapeado enquanto estava na bandeja/icone, restaura AI também
                 if hasattr(self, "_tray_icon") and self._tray_icon:
-                    # mapa vindo de pystray; acionamos restauração segura na thread do Tk
                     self.root.after(0, _restore_from_tray)
                 else:
-                    # se foi iconify fallback (taskbar), reativa AI se havíamos desativado
                     if hasattr(self, "_ai_was_available"):
                         try:
                             self.ai.available = self._ai_was_available
+                            self._reconnect_ollama()
                             print(f"[JARVIS][AI] restaurado via taskbar. available={self.ai.available}")
                             del self._ai_was_available
                         except Exception:
                             pass
-                    # retoma tarefas de background quando mapeado
                     try:
                         if hasattr(self, "resume_background_tasks"):
                             self.resume_background_tasks()
                     except Exception:
                         pass
-                    # garantir que volte a ficar on-top quando mapeado
                     try:
                         self.root.attributes("-topmost", True)
                     except Exception:
@@ -983,6 +1236,16 @@ class JarvisApp:
         )
         self.status_label.pack(side="left", padx=8)
 
+        # Novo label para status de gravação
+        self.recording_label = tk.Label(
+            self.top_bar,
+            text="",
+            fg="#ff5555",  # Vermelho para indicar gravação
+            bg=BG_COLOR,
+            font=("Consolas", 10)
+        )
+        self.recording_label.pack(side="left", padx=8)
+
         # buttons (minimize, close) on top-right
         btn_frame = tk.Frame(self.top_bar, bg=BG_COLOR)
         btn_frame.pack(side="right", padx=6)
@@ -1211,8 +1474,163 @@ class JarvisApp:
         # initial messages
         if self.ai.available == True:
             self.say("JARVIS online. Digite um comando ou mensagem.")
+            if VOICE_AVAILABLE and self.voice_system:
+                self.say("Pressione CTRL+ALT+V para falar.")
         else:
             self.say("JARVIS online. Apenas comandos.")
+            if VOICE_AVAILABLE and self.voice_system:
+                self.say("Pressione CTRL+ALT+V para comandos por voz.")
+
+    def _reconnect_ollama(self):
+        """Tenta reconectar com o Ollama quando a janela é restaurada"""
+        try:
+            print(f"[JARVIS][AI] Tentando reconectar com Ollama...")
+            # Testa a conexão com o Ollama
+            test_url = self.ai.url if hasattr(self.ai, 'url') else "http://localhost:11434/api/chat"
+            try:
+                # Tenta uma requisição simples de saúde
+                r = requests.get(test_url.replace('/api/chat', '/api/version'), timeout=2)
+                if r.status_code < 500:
+                    print(f"[JARVIS][AI] Conexão com Ollama estabelecida. available=True")
+                    self.ai.available = True
+                    return True
+            except Exception:
+                pass
+            
+            # Tenta endpoints alternativos
+            endpoints = [
+                test_url,
+                test_url.replace('/api/chat', '/api/tags'),
+                test_url.replace('/api/chat', '/api/version'),
+                "http://localhost:11434/api/version",
+                "http://localhost:11434/api/tags",
+                "http://localhost:11434/api/chat"
+            ]
+            
+            for ep in endpoints:
+                try:
+                    r = requests.get(ep, timeout=2)
+                    if r.status_code < 500:
+                        if '/api/chat' in ep:
+                            self.ai.url = ep
+                        print(f"[JARVIS][AI] Ollama encontrado em {ep}")
+                        self.ai.available = True
+                        return True
+                except Exception:
+                    continue
+            
+            print(f"[JARVIS][AI] Não foi possível conectar ao Ollama")
+            self.ai.available = False
+            return False
+            
+        except Exception as e:
+            print(f"[JARVIS][AI] Erro ao reconectar: {e}")
+            self.ai.available = False
+            return False
+
+    def restore_and_activate_ai(self):
+        """Reativa a IA se estiver desativada E tenta reconectar com Ollama"""
+        # Se a IA foi marcada como desativada (na bandeja), reativa
+        if hasattr(self, "_ai_was_available") and self._ai_was_available and not self.ai.available:
+            self.ai.available = self._ai_was_available
+            try:
+                del self._ai_was_available
+            except:
+                pass
+            print(f"[JARVIS][AI] IA reativada. available={self.ai.available}")
+        
+        # SEMPRE tenta reconectar quando a janela é restaurada
+        self._reconnect_ollama()
+
+    def cancel_ai_response(self):
+        """Cancela a resposta da IA em andamento"""
+        self._ai_cancelled = True
+        self.stop_thinking()
+        self.say("Resposta cancelada.")
+        
+        # Reseta a flag
+        self._ai_cancelled = False
+
+    def restore_from_tray_or_minimal(self):
+        """Restaura a janela se estiver na bandeja ou em presença mínima"""
+        # Se estiver na bandeja, restaura
+        if hasattr(self, "_tray_icon") and self._tray_icon:
+            try:
+                # Primeiro, para o ícone da bandeja
+                try:
+                    self._tray_icon.stop()
+                except:
+                    pass
+                self._tray_icon = None
+                
+                # Restaura a janela
+                self.root.deiconify()
+                self.root.attributes("-topmost", True)
+                self.root.overrideredirect(True)
+                self.root.lift()
+                self.root.focus_force()
+                
+                # Retoma tarefas de background
+                self.resume_background_tasks()
+                
+                # IMPORTANTE: Reconecta com o Ollama
+                self._reconnect_ollama()
+                
+                print("[JARVIS] Janela restaurada da bandeja.")
+                
+            except Exception as e:
+                print(f"[JARVIS] Erro ao restaurar da bandeja: {e}")
+                try:
+                    self.root.deiconify()
+                    self.root.attributes("-topmost", True)
+                    self.root.lift()
+                    self.root.focus_force()
+                    self._reconnect_ollama()
+                except:
+                    pass
+        
+        # Se estiver em presença mínima, sai
+        if self._presence_minimal:
+            try:
+                self._exit_minimal_presence()
+                print("[JARVIS] Saindo do modo presença mínima.")
+            except Exception as e:
+                print(f"[JARVIS] Erro ao sair do modo presença mínima: {e}")
+        
+        # Traz para frente e foca
+        try:
+            self.root.attributes("-topmost", True)
+            self.root.lift()
+            self.root.focus_force()
+            self.entry.focus_set()
+            print("[JARVIS] Janela focada.")
+        except Exception as e:
+            print(f"[JARVIS] Erro ao focar janela: {e}")
+
+    def show_recording_status(self, recording):
+        """Mostra ou esconde o status de gravação"""
+        if recording:
+            self.recording_label.config(text="● GRAVANDO")
+        else:
+            self.recording_label.config(text="")
+
+    def process_voice_input(self, text):
+        """Processa texto de entrada por voz"""
+        # Primeiro, ativar a IA se necessário (antes de colocar no campo)
+        if hasattr(self, "_ai_was_available") and self._ai_was_available and not self.ai.available:
+            self.ai.available = self._ai_was_available
+            try:
+                del self._ai_was_available
+            except:
+                pass
+            print(f"[JARVIS][AI] IA reativada por voz (ainda na bandeja). available={self.ai.available}")
+        
+        # Coloca o texto no campo de entrada
+        self.entry.delete(0, tk.END)
+        self.entry.insert(0, text)
+        
+        # Simula pressionar Enter para enviar
+        self.send()
 
     def say(self, text):
         self.chat.config(state="normal")
@@ -1234,6 +1652,15 @@ class JarvisApp:
             return
         self._thinking = True
         self._think_dots = 0
+        
+        # Pausa o timer de presença enquanto a IA está pensando
+        if hasattr(self, "_presence_job") and self._presence_job:
+            try:
+                self.root.after_cancel(self._presence_job)
+                self._presence_job = None
+            except:
+                pass
+        
         def _tick():
             if not getattr(self, "_thinking", False):
                 return
@@ -1257,6 +1684,13 @@ class JarvisApp:
             self.status_label.config(text="")
         except Exception:
             pass
+        
+        # Retoma o timer de presença após a IA parar de pensar
+        if not getattr(self, "_paused", False) and not getattr(self, "_tray_icon", None):
+            try:
+                self._presence_job = self.root.after(int(self._presence_interval * 1000), self._presence_check)
+            except:
+                pass
 
     def start_response_stream(self):
         self.chat.config(state="normal")
@@ -1288,23 +1722,44 @@ class JarvisApp:
         direct_keywords = (
             "abrir ", "abra ", "pesquisar ", "pesquise ",
             "youtube ", "yt ", "digitar ", "digite ", "ajuda", "help", "?",
-            "ytvideo ", "ytv "
+            "ytvideo ", "ytv ", "vídeo ", "o vídeo "
         )
 
-        # Trata comandos diretos mesmo se o modelo IA estiver disponível
+        # Comandos de cancelamento
+        if text_lower in ["cancelar", "parar"]:
+            self.cancel_ai_response()
+            return
+
+        # Trata comandos diretos
         if text.startswith("/") or text_lower.startswith(direct_keywords) or text_lower in ("limpar", "cls"):
-            # se já começar com '/', encaminha tal qual; senão adiciona '/' para compatibilidade com handle_direct
             if text.startswith("/"):
                 self.router.handle_direct(text)
             else:
                 self.router.handle_direct("/" + text)
             return
 
-        # se o modelo local não estiver disponível, informa e sai
+        # ATENÇÃO: Agora ativamos a IA mesmo estando na bandeja
+        # Mas primeiro garantimos que a IA está realmente conectada
+        if hasattr(self, "_ai_was_available") and self._ai_was_available and not self.ai.available:
+            self.ai.available = self._ai_was_available
+            try:
+                del self._ai_was_available
+            except:
+                pass
+            print(f"[JARVIS][AI] IA reativada (ainda na bandeja). available={self.ai.available}")
+        
+        # AGORA: Sempre verifica a conexão antes de tentar usar a IA
         if not self.ai.available:
-            self.say("Modelo local indisponível. Para comandos, comece por: abrir, pesquisar, youtube, digitar, limpar.")
-            return
+            # Tenta reconectar uma última vez
+            if self._reconnect_ollama():
+                print(f"[JARVIS][AI] Reconexão bem-sucedida!")
+            else:
+                self.say("Modelo local indisponível. Para comandos, comece por: abrir, pesquisar, youtube, digitar, limpar.")
+                return
 
+        # Reseta flag de cancelamento antes de iniciar nova resposta
+        self._ai_cancelled = False
+        
         threading.Thread(
             target=self._handle_ai,
             args=(text,),
@@ -1312,30 +1767,121 @@ class JarvisApp:
         ).start()
 
     def _handle_ai(self, text):
-        # tenta streaming de tokens para dar sensação de "digitando"
-        self.start_thinking()
         streamed = False
+        cancelled = False
+        
         try:
-            # prepare UI for streaming
+            # VERIFICAÇÃO CRÍTICA: A IA deve estar disponível
+            if not self.ai.available:
+                print(f"[JARVIS][AI] ERRO: IA não disponível para processar: '{text}'")
+                self.root.after(0, lambda: self.say("IA não disponível no momento. Tente novamente."))
+                return
+            
+            print(f"[JARVIS][AI] Processando pergunta: '{text}'")
+            
+            # Prepara a UI para streaming
+            self.root.after(0, self.start_thinking)
+            
+            # Restaura a janela ANTES de fazer qualquer requisição
+            self.root.after(0, self.restore_from_tray_or_minimal)
+            
+            # Pequena pausa para garantir que a janela foi restaurada
+            time.sleep(0.3)
+            
+            # Inicia a resposta
             self.root.after(0, self.start_response_stream)
 
             def on_token(token):
-                # agendar update da UI na thread principal
+                if getattr(self, "_ai_cancelled", False):
+                    return False
                 try:
                     self.root.after(0, lambda t=token: self.append_response_token(t))
                 except Exception:
                     pass
+                return True
 
-            # bloco de streaming (bloqueante nesta thread de worker, mas segura para UI via after)
-            self.ai.stream_chat(text, on_token)
-            streamed = True
-        except Exception:
+            # Tenta streaming primeiro
+            try:
+                print(f"[JARVIS][AI] Iniciando streaming para: '{text}'")
+                print(f"[JARVIS][AI] URL: {self.ai.url}, Modelo: {self.ai.model}")
+                
+                messages = [
+                    {"role": "system", "content": JARVIS_PERSONALITY},
+                    {"role": "user", "content": text}
+                ]
+
+                payload = {
+                    "model": self.ai.model,
+                    "messages": messages,
+                    "stream": True,
+                    "options": {
+                        "temperature": 0.7
+                    }
+                }
+
+                print(f"[JARVIS][AI] Enviando requisição...")
+                with requests.post(self.ai.url, json=payload, stream=True, timeout=30) as r:
+                    r.raise_for_status()
+                    print(f"[JARVIS][AI] Resposta recebida, status: {r.status_code}")
+                    
+                    for line in r.iter_lines():
+                        if not line:
+                            continue
+                        if self._ai_cancelled:
+                            cancelled = True
+                            break
+                        
+                        line_str = line.decode('utf-8')
+                        try:
+                            data = json.loads(line_str)
+                            token = data.get("message", {}).get("content", "")
+                            if token:
+                                if not on_token(token):
+                                    cancelled = True
+                                    break
+                        except json.JSONDecodeError as e:
+                            print(f"[JARVIS][AI] Erro ao decodificar JSON: {e}, linha: {line_str}")
+                            continue
+                
+                streamed = True
+                print(f"[JARVIS][AI] Streaming concluído com sucesso")
+                
+            except requests.exceptions.ConnectionError as e:
+                print(f"[JARVIS][AI] Erro de conexão: {e}")
+                # Marca IA como indisponível
+                self.ai.available = False
+                streamed = False
+            except requests.exceptions.Timeout as e:
+                print(f"[JARVIS][AI] Timeout: {e}")
+                streamed = False
+            except Exception as e:
+                print(f"[JARVIS][AI] Erro no streaming: {type(e).__name__}: {e}")
+                if not self._ai_cancelled:
+                    streamed = False
+                else:
+                    cancelled = True
+                    
+        except Exception as e:
+            print(f"[JARVIS][AI] Erro geral no _handle_ai: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             streamed = False
+            
         finally:
-            if streamed:
-                # finaliza stream e indicador
+            if streamed and not cancelled:
                 try:
                     self.root.after(0, self.end_response_stream)
+                    print(f"[JARVIS][AI] Resposta finalizada via streaming")
+                except Exception:
+                    pass
+                try:
+                    self.root.after(0, self.stop_thinking)
+                except Exception:
+                    pass
+                return
+            elif cancelled:
+                try:
+                    self.root.after(0, lambda: self.say("Resposta cancelada."))
                 except Exception:
                     pass
                 try:
@@ -1344,15 +1890,38 @@ class JarvisApp:
                     pass
                 return
 
-        # fallback synchrone: pergunta normal (sem streaming)
+        # Fallback: método síncrono (sem streaming)
+        print(f"[JARVIS][AI] Tentando fallback síncrono...")
+        
+        if self._ai_cancelled:
+            self.root.after(0, lambda: self.say("Resposta cancelada."))
+            self.root.after(0, self.stop_thinking)
+            return
+            
         try:
+            print(f"[JARVIS][AI] Chamando ai.decide()...")
             decision = self.ai.decide(text)
-            if decision.get("action") == "chat":
-                self.root.after(0, lambda: self.say(decision.get("response", "")))
+            print(f"[JARVIS][AI] Resposta do decide(): {decision}")
+            
+            if not self._ai_cancelled:
+                if decision.get("action") == "chat":
+                    response = decision.get("response", "")
+                    if response:
+                        self.root.after(0, lambda: self.say(response))
+                        print(f"[JARVIS][AI] Resposta exibida via fallback")
+                    else:
+                        self.root.after(0, lambda: self.say("Desculpe, não consegui gerar uma resposta."))
+                        print(f"[JARVIS][AI] Resposta vazia do fallback")
+                else:
+                    self.root.after(0, lambda: self.router.execute(decision))
             else:
-                self.root.after(0, lambda: self.router.execute(decision))
-        except Exception:
-            self.root.after(0, lambda: self.say("Não consegui interpretar sua solicitação."))
+                self.root.after(0, lambda: self.say("Resposta cancelada."))
+        except Exception as e:
+            print(f"[JARVIS][AI] Erro no fallback: {type(e).__name__}: {e}")
+            if not self._ai_cancelled:
+                self.root.after(0, lambda: self.say(f"Erro ao processar sua solicitação: {type(e).__name__}"))
+            else:
+                self.root.after(0, lambda: self.say("Resposta cancelada."))       
         finally:
             try:
                 self.root.after(0, self.stop_thinking)
@@ -1371,4 +1940,10 @@ class JarvisApp:
 # MAIN
 # =========================
 if __name__ == "__main__":
+    # Verificar dependências de voz
+    if not VOICE_AVAILABLE:
+        print("⚠️  Bibliotecas de voz não disponíveis. Instale com:")
+        print("   pip install sounddevice numpy scipy openai-whisper keyboard")
+        print("   A funcionalidade de voz será desativada.")
+    
     JarvisApp().run()
