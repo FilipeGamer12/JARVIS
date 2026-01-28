@@ -570,6 +570,13 @@ class JarvisApp:
         self.ai = AIEngine()
         self.router = CommandRouter(self)
 
+        # Intervalo de checagem de presença (maior quando IA não disponível para economizar CPU)
+        # em hardware fraco preferimos checagens longas para reduzir uso de CPU
+        self._presence_interval = 60 if not self.ai.available else 1
+        # flag que indica que tarefas de background devem ficar pausadas (ex.: quando na bandeja)
+        self._paused = False
+        self._presence_job = None
+
         # log estado inicial da IA
         try:
             print(f"[JARVIS][AI] inicializado. available={self.ai.available}")
@@ -641,6 +648,12 @@ class JarvisApp:
                         self.entry.focus_set()
                     except Exception:
                         pass
+                    # retoma tarefas de background ao restaurar
+                    try:
+                        if hasattr(self, "resume_background_tasks"):
+                            self.resume_background_tasks()
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             except Exception:
@@ -666,6 +679,13 @@ class JarvisApp:
                 except Exception:
                     pass
                 self.root.withdraw()
+            except Exception:
+                pass
+
+            # pause background activity to reduce CPU while in tray
+            try:
+                if hasattr(self, "pause_background_tasks"):
+                    self.pause_background_tasks()
             except Exception:
                 pass
 
@@ -711,6 +731,12 @@ class JarvisApp:
                             del self._ai_was_available
                         except Exception:
                             pass
+                    # retoma tarefas de background quando mapeado
+                    try:
+                        if hasattr(self, "resume_background_tasks"):
+                            self.resume_background_tasks()
+                    except Exception:
+                        pass
                     # garantir que volte a ficar on-top quando mapeado
                     try:
                         self.root.attributes("-topmost", True)
@@ -814,17 +840,73 @@ class JarvisApp:
         def _presence_check():
              try:
                  # não faz nada enquanto estiver na bandeja
-                 if getattr(self, "_tray_icon", None):
-                     self.root.after(1000, _presence_check)
-                     return
-                 idle = time.time() - getattr(self, "_last_interaction", time.time())
-                 if idle > 30 and not self._presence_minimal:
+                if getattr(self, "_tray_icon", None) or getattr(self, "_paused", False):
+                    # se estivermos na bandeja ou pausados, agendamos checagem mais tarde
+                    try:
+                        self._presence_job = self.root.after(max(1000, int(self._presence_interval * 1000)), _presence_check)
+                    except Exception:
+                        pass
+                    return
+                idle = time.time() - getattr(self, "_last_interaction", time.time())
+                if idle > 30 and not self._presence_minimal:
                      _enter_minimal_presence()
                  # não forçamos saída da presença mínima por movimento/tecla; só por clique
              except Exception:
                  pass
              finally:
-                 self.root.after(1000, _presence_check)
+                 try:
+                     # armazena id do job para possibilitar cancelamento quando for para bandeja
+                     self._presence_job = self.root.after(int(self._presence_interval * 1000), _presence_check)
+                 except Exception:
+                     pass
+
+        # pause/resume helpers para reduzir uso de CPU quando em bandeja/standby
+        def pause_background_tasks():
+            if getattr(self, "_paused", False):
+                return
+            self._paused = True
+            try:
+                if getattr(self, "_presence_job", None):
+                    try:
+                        self.root.after_cancel(self._presence_job)
+                    except Exception:
+                        pass
+                    self._presence_job = None
+            except Exception:
+                pass
+            try:
+                # cancelar animação de "pensando"
+                if getattr(self, "_thinking_job", None):
+                    try:
+                        self.root.after_cancel(self._thinking_job)
+                    except Exception:
+                        pass
+                    self._thinking_job = None
+            except Exception:
+                pass
+            try:
+                self.status_label.config(text="")
+            except Exception:
+                pass
+
+        def resume_background_tasks():
+            if not getattr(self, "_paused", False):
+                return
+            self._paused = False
+            # ajustar intervalo baseado na disponibilidade da IA
+            try:
+                self._presence_interval = 1 if getattr(self.ai, "available", False) else 60
+            except Exception:
+                self._presence_interval = 60
+            try:
+                # agendar próxima checagem usando o intervalo atual
+                self._presence_job = self.root.after(int(self._presence_interval * 1000), _presence_check)
+            except Exception:
+                pass
+
+        # expose pause/resume como métodos da instância
+        self.pause_background_tasks = pause_background_tasks
+        self.resume_background_tasks = resume_background_tasks
 
          # binds que resetam o timer de presença (NÃO saem da presença mínima)
         for ev in ("<Motion>", "<KeyPress>", "<Enter>", "<FocusIn>"):
@@ -840,7 +922,13 @@ class JarvisApp:
         # => não bindamos clique globalmente; usaremos o título para entrar/sair do modo mínimo
 
         # inicia checagem periódica de presença
-        self.root.after(1000, _presence_check)
+        try:
+            self._presence_job = self.root.after(int(self._presence_interval * 1000), _presence_check)
+        except Exception:
+            try:
+                self._presence_job = self.root.after(1000, _presence_check)
+            except Exception:
+                pass
 
         # --- drag support for custom titlebar ---
         def _start_move(event):
@@ -1140,6 +1228,9 @@ class JarvisApp:
     # -- thinking / streaming helpers --
     def start_thinking(self):
         if getattr(self, "_thinking", False):
+            return
+        # do not start thinking animation while paused (tray/low-power)
+        if getattr(self, "_paused", False):
             return
         self._thinking = True
         self._think_dots = 0
