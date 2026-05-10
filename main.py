@@ -14,6 +14,7 @@ import re
 import sys
 import importlib.util
 import traceback
+import unicodedata
 from typing import Dict, List, Any, Optional
 try:
     import pystray
@@ -36,6 +37,9 @@ try:
     import tempfile
     import keyboard
     VOICE_AVAILABLE = True
+    import platform
+    if platform.system() == "Windows":
+        import winsound
 except Exception:
     sd = None
     np = None
@@ -98,6 +102,13 @@ class AddonManager:
         self.failed_addons: List[Dict[str, str]] = []
         self.addon_direct_keywords = []
         self.direct_keyword_handlers = {}
+        
+        try:
+            from PYbrowser import TerminalSearchBrowser
+            self.browser = TerminalSearchBrowser(max_results=5)
+        except Exception as e:
+            print(f"[JARVIS] PYbrowser indisponível: {e}")
+            self.browser = None
         
         # Hooks disponíveis para os addons
         self.hooks = {
@@ -284,9 +295,9 @@ class VoiceSystem:
         self.blocksize = 1024
         
         # Configurações de detecção de silêncio
-        self.silence_threshold = 0.01
-        self.silence_duration = 1.5
-        self.min_recording_time = 0.5
+        self.silence_threshold = 0.001
+        self.silence_duration = 3.0
+        self.min_recording_time = 1.0
         
         # Controle de silêncio
         self.last_sound_time = None
@@ -324,6 +335,24 @@ class VoiceSystem:
             print(f"Erro ao carregar modelo de voz: {e}")
             self.model_loaded = False
     
+    def _play_start_sound(self):
+        """Toca um som curto padrão do sistema para indicar início da gravação."""
+        try:
+            if platform.system() == "Windows":
+                # Toca o som "SystemAsterisk" (sino suave do Windows)
+                # SND_ASYNC garante que não bloqueie a gravação
+                import winsound
+                winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+            elif platform.system() == "Darwin":  # macOS
+                subprocess.run(["afplay", "/System/Library/Sounds/Ping.aiff"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:  # Linux e outros
+                # Tenta usar o beep do terminal ou o comando 'paplay' (PulseAudio)
+                subprocess.run(["paplay", "/usr/share/sounds/freedesktop/stereo/message.oga"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    
     def toggle_recording(self):
         """Alterna entre iniciar e parar gravação"""
         if not self.is_recording:
@@ -345,6 +374,8 @@ class VoiceSystem:
         
         # Restaura janela se estiver minimizada e reativa IA se necessário
         self.jarvis.restore_and_activate_ai()
+        
+        self._play_start_sound()
         
         # Inicia gravação
         self.is_recording = True
@@ -552,15 +583,176 @@ def clean_query(text: str, remove_words):
         for w in remove_words:
             q = re.sub(re.escape(w), "", q, flags=re.IGNORECASE)
         return q.strip()
-    # caso normal, mantém comportamento anterior
-    q = text.lower()
-    for w in remove_words:
-        q = q.replace(w, "")
-    return q.strip()
+
+
+# =========================
+# PYBROWSER / CONHECIMENTO
+# =========================
+try:
+    from PYbrowser import TerminalSearchBrowser
+    PYBROWSER_AVAILABLE = True
+except Exception:
+    TerminalSearchBrowser = None
+    PYBROWSER_AVAILABLE = False
+
+
+def _normalize_for_match(value: str) -> str:
+    value = value.lower().strip()
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = re.sub(r"[^a-z0-9]+", "", value)
+    return value
+
+
+class BrowserKnowledgeProvider:
+    """Integra o PYbrowser para buscar contexto textual na Wikipédia."""
+
+    def __init__(self):
+        self.available = bool(PYBROWSER_AVAILABLE and TerminalSearchBrowser is not None)
+        self.browser = None
+        self.cache: Dict[str, Dict[str, str]] = {}
+
+        if self.available:
+            try:
+                self.browser = TerminalSearchBrowser(max_results=5)
+                print("[PYbrowser] Instância criada com sucesso.")
+            except Exception as e:
+                print(f"[PYbrowser] Falha ao inicializar: {e}")
+                self.available = False
+                self.browser = None
+
+    def _search(self, query: str) -> List:
+        """Realiza a busca usando o PYbrowser, com idioma pt-BR."""
+        if not self.browser:
+            print("[PYbrowser] Browser não disponível para busca.")
+            return []
+
+        try:
+            print(f"[PYbrowser] Buscando: {query}")
+            # O PYbrowser aceita idioma como parâmetro; usamos pt-BR
+            results = self.browser.search(query, language="pt-BR")
+            if results:
+                print(f"[PYbrowser] Resultados obtidos: {len(results)}")
+                for i, r in enumerate(results):
+                    print(f"  [{i+1}] {r.title} - {r.url}")
+            else:
+                print("[PYbrowser] Nenhum resultado retornado.")
+            return results
+        except Exception as e:
+            print(f"[PYbrowser] Erro na busca: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+    def _extract_text(self, url: str) -> str:
+        if not self.browser:
+            return ""
+
+        try:
+            print(f"[PYbrowser] Extraindo texto de: {url}")
+            text = self.browser.export_text(url)
+
+            # se o texto vier vazio, tenta inferir a URL limpa da Wikipédia a partir do termo
+            if not text and "uddg=" in url:
+                import urllib.parse
+                parsed = urllib.parse.urlparse(url)
+                qs = urllib.parse.parse_qs(parsed.query)
+                uddg = qs.get("uddg", [""])[0]
+                if uddg and "wikipedia.org" in uddg:
+                    clean_url = uddg  # URL real já está no parâmetro uddg
+                    print(f"[PYbrowser] Tentando URL limpa: {clean_url}")
+                    text = self.browser.export_text(clean_url)
+
+            if not text:
+                print("[PYbrowser] export_text retornou string vazia.")
+            else:
+                print(f"[PYbrowser] Texto extraído: {len(text)} caracteres")
+            return text
+        except Exception as e:
+            print(f"[PYbrowser] Erro ao extrair texto: {e}")
+            import traceback
+            traceback.print_exc()
+            return ""
+
+    def find_wikipedia_context(self, query: str, max_chars: int = 8000) -> Dict[str, str]:
+        """
+        Busca por "{termo} wikipedia", abre o primeiro resultado e extrai texto.
+        Retorna um dicionário com texto bruto, url e termo usado.
+        """
+        normalized = query.strip()
+        cache_key = _normalize_for_match(normalized)
+
+        if cache_key in self.cache:
+            cached = self.cache[cache_key]
+            print(f"[PYbrowser] Cache hit para: {normalized}")
+            return {
+                "query": normalized,
+                "search_term": cached.get("search_term", normalized),
+                "url": cached.get("url", ""),
+                "text": cached.get("text", ""),
+                "title": cached.get("title", ""),
+                "cached": True,
+            }
+
+        search_term = f"{normalized} wikipedia"
+        results = self._search(search_term)
+
+        if not results:
+            data = {
+                "query": normalized,
+                "search_term": search_term,
+                "url": "",
+                "text": "",
+                "title": "",
+                "cached": False,
+            }
+            self.cache[cache_key] = data
+            return data
+
+        # Prioriza resultado com 'wikipedia' na URL ou título
+        chosen = None
+        for item in results:
+            if "wikipedia" in item.url.lower() or "wikipedia" in item.title.lower():
+                chosen = item
+                print(f"[PYbrowser] Selecionado Wikipedia: {item.url}")
+                break
+
+        if chosen is None:
+            print("[PYbrowser] Nenhum resultado Wikipedia exato, usando primeiro.")
+            chosen = results[0]
+
+        url = chosen.url
+        title = chosen.title
+        text_value = self._extract_text(url)
+
+        if text_value:
+            # Limpeza básica: reduz quebras excessivas
+            text_value = re.sub(r"\n{3,}", "\n\n", text_value).strip()
+            # Trunca se necessário
+            if len(text_value) > max_chars:
+                text_value = text_value[:max_chars].rsplit(" ", 1)[0].strip()
+                print(f"[PYbrowser] Texto truncado para {max_chars} caracteres")
+        else:
+            print("[PYbrowser] Texto extraído vazio.")
+
+        data = {
+            "query": normalized,
+            "search_term": search_term,
+            "url": url,
+            "text": text_value,
+            "title": title,
+            "cached": False,
+        }
+        self.cache[cache_key] = data
+        return data
+
+    def has_context(self) -> bool:
+        return self.available and self.browser is not None
 
 # =========================
 # IA (OLLAMA)
 # =========================
+
 class AIEngine:
     def __init__(self, url: str = None, model: str = None):
         base_url = url or os.getenv("OLLAMA_URL") or "http://localhost:11434/api/chat"
@@ -568,12 +760,9 @@ class AIEngine:
 
         parsed = urllib.parse.urlparse(base_url)
         scheme = parsed.scheme or "http"
-        netloc = parsed.netloc or parsed.path  # fallback if only host provided
+        netloc = parsed.netloc or parsed.path
         base = f"{scheme}://{netloc}"
-        candidates = []
-        # keep the provided URL first
-        candidates.append(base_url)
-        # common alternate endpoints
+        candidates = [base_url]
         candidates.extend([
             urllib.parse.urljoin(base, "/api/chat"),
             urllib.parse.urljoin(base, "/api/status"),
@@ -585,7 +774,6 @@ class AIEngine:
         self.url = base_url
         self.available = False
 
-        # tenta detectar serviço de forma robusta (aceita GET ou POST chat)
         for ep in candidates:
             try:
                 if ep.endswith("/chat"):
@@ -598,36 +786,97 @@ class AIEngine:
                     r = requests.post(ep, json=payload, timeout=2)
                 else:
                     r = requests.get(ep, timeout=2)
-                # considera disponível qualquer resposta não-5xx (proximal check)
+
                 if r is not None and r.status_code < 500:
                     self.available = True
-                    # prefer usar um endpoint /chat se foi bem sucedido
                     if ep.endswith("/chat"):
                         self.url = ep
                     break
             except Exception:
                 continue
 
-    def decide(self, user_text):
-        messages = [
-            {"role": "system", "content": JARVIS_PERSONALITY},
-            {"role": "user", "content": user_text}
+    def _build_messages(self, user_text: str, context: str = ""):
+        system = JARVIS_PERSONALITY
+        if context:
+            system += (
+                "\n\nUse o contexto fornecido como base principal para responder."
+                "\nSe o contexto não for suficiente, diga isso de forma direta."
+            )
+
+        user_payload = user_text
+        if context:
+            user_payload = (
+                "Contexto extraído da Wikipédia:\n"
+                f"{context}\n\n"
+                f"Pergunta do usuário:\n{user_text}"
+            )
+
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_payload}
         ]
 
+    def _post_chat(self, messages, stream: bool = False, temperature: float = 0.7, timeout: int = 60):
         payload = {
             "model": self.model,
             "messages": messages,
-            "stream": False,
-            "options": {
-                "temperature": 0
-            }
+            "stream": stream,
+            "options": {"temperature": temperature}
         }
+        return requests.post(self.url, json=payload, stream=stream, timeout=timeout)
+
+    def plan(self, user_text: str) -> dict:
+        planner_prompt = (
+            "Você é o planejador de ações do JARVIS. "
+            "Responda SOMENTE com JSON válido, sem markdown e sem texto extra.\n\n"
+            "Formato obrigatório:\n"
+            "{\n"
+            '  "action": "chat|research|open|search|youtube|ytvideo|type|clear",\n'
+            '  "target": "",\n'
+            '  "query": "",\n'
+            '  "text": "",\n'
+            '  "context_query": ""\n'
+            "}\n\n"
+            "Regras:\n"
+            "- Se o usuário pedir para pesquisar informação, explicar um tema, ou responder algo que exija conhecimento externo, use action=\"research\" e preencha query com o termo principal.\n"
+            "- Se pedir para abrir algo, use action=\"open\" e target com o nome do app/arquivo.\n"
+            "- Se pedir pesquisa no Google, use action=\"search\" e query.\n"
+            "- Se pedir YouTube, use action=\"youtube\" ou \"ytvideo\".\n"
+            "- Se pedir para digitar, use action=\"type\" e text.\n"
+            "- Se pedir para limpar, use action=\"clear\".\n"
+            "- Caso contrário, use action=\"chat\".\n"
+        )
+
+        messages = [
+            {"role": "system", "content": planner_prompt},
+            {"role": "user", "content": user_text}
+        ]
 
         try:
-            r = requests.post(self.url, json=payload, timeout=60)
+            r = self._post_chat(messages, stream=False, temperature=0, timeout=30)
+            r.raise_for_status()
+            try:
+                resp = r.json()
+                content = resp.get("message", {}).get("content", "") or r.text
+            except Exception:
+                content = r.text
+            data = extract_json(content)
+            if not isinstance(data, dict):
+                return {"action": "chat", "response": content or "Não consegui planejar a ação."}
+            if not data.get("action"):
+                data["action"] = "chat"
+            return data
+        except Exception as e:
+            print(f"[JARVIS][AI] Falha no planner: {e}")
+            return {"action": "chat", "response": "Não consegui interpretar sua solicitação."}
+
+    def decide(self, user_text):
+        messages = self._build_messages(user_text)
+
+        try:
+            r = self._post_chat(messages, stream=False, temperature=0.7, timeout=60)
             r.raise_for_status()
 
-            # Sempre tratar resposta como conversa (chat). Não interpretar/retornar comandos.
             try:
                 resp = r.json()
                 content = resp.get("message", {}).get("content")
@@ -645,28 +894,19 @@ class AIEngine:
                 "response": "Não consegui interpretar sua solicitação."
             }
 
-    def stream_chat(self, user_text, on_token):
-        messages = [
-            {"role": "system", "content": JARVIS_PERSONALITY},
-            {"role": "user", "content": user_text}
-        ]
-
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": True,
-            "options": {
-                "temperature": 0.7
-            }
-        }
+    def stream_chat(self, user_text, on_token, context: str = ""):
+        messages = self._build_messages(user_text, context=context)
 
         try:
-            with requests.post(self.url, json=payload, stream=True, timeout=60) as r:
+            with self._post_chat(messages, stream=True, temperature=0.7, timeout=60) as r:
                 r.raise_for_status()
                 for line in r.iter_lines():
                     if not line:
                         continue
-                    token = json.loads(line).get("message", {}).get("content", "")
+                    try:
+                        token = json.loads(line).get("message", {}).get("content", "")
+                    except Exception:
+                        token = ""
                     if token:
                         on_token(token)
         except Exception as e:
@@ -675,7 +915,18 @@ class AIEngine:
 # =========================
 # COMMAND ROUTER (MODIFICADO PARA ADDONS)
 # =========================
+
+
 class CommandRouter:
+    KNOWN_FILE_EXTENSIONS = {
+        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.ico',   # imagens
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', # documentos
+        '.txt', '.csv', '.json', '.xml', '.md', '.py', '.js',      # texto/código
+        '.zip', '.rar', '.7z', '.tar', '.gz',                      # compactados
+        '.mp3', '.wav', '.ogg', '.flac',                           # áudio
+        '.mp4', '.avi', '.mkv', '.mov',                            # vídeo
+    }
+    
     def __init__(self, app):
         self.app = app
         self.addon_manager = app.addon_manager
@@ -685,27 +936,22 @@ class CommandRouter:
             self.app.say("Comando bloqueado por segurança.")
             return True
 
-        # preserve original (sem o leading '/') para repassar sem lowercase
         orig = text[1:].strip()
         cmd = orig.lower()
 
-        # Executa hooks pre_command
         hook_results = self.addon_manager.execute_hooks('pre_command', text)
         for result in hook_results:
-            if result is True:  # Se um hook retornar True, interrompe o processamento
+            if result is True:
                 return True
 
-        # Comando para cancelar resposta da IA
         if cmd in ["cancelar", "parar"]:
             self.app.cancel_ai_response()
             return True
 
-        # Verifica se é um comando de addon
         cmd_parts = cmd.split()
         if cmd_parts and cmd_parts[0] in self.addon_manager.custom_commands:
             addon_cmd = self.addon_manager.custom_commands[cmd_parts[0]]
             try:
-                # Chama o handler do addon
                 if len(cmd_parts) > 1:
                     addon_cmd['handler'](' '.join(cmd_parts[1:]))
                 else:
@@ -716,20 +962,11 @@ class CommandRouter:
                 return True
 
         if cmd.startswith("abrir ") or cmd.startswith("abra "):
-            if cmd.startswith("abrir "):
-                self._open(orig[6:])
-            else:
-                self._open(orig[5:])
+            self._open(orig[6:] if cmd.startswith("abrir ") else orig[5:])
         elif cmd.startswith("pesquisar ") or cmd.startswith("pesquise "):
-            if cmd.startswith("pesquisar "):
-                self._search(orig[10:])
-            else:
-                self._search(orig[9:])
+            self._search(orig[10:] if cmd.startswith("pesquisar ") else orig[9:])
         elif cmd.startswith("youtube ") or cmd.startswith("yt "):
-            if cmd.startswith("youtube "):
-                self._youtube(orig[8:])
-            else:
-                self._youtube(orig[3:])
+            self._youtube(orig[8:] if cmd.startswith("youtube ") else orig[3:])
         elif cmd.startswith("ytvideo ") or cmd.startswith("ytv ") or cmd.startswith("vídeo ") or cmd.startswith("o vídeo "):
             if cmd.startswith("ytvideo "):
                 self._ytvideo(orig[8:])
@@ -740,18 +977,14 @@ class CommandRouter:
             else:
                 self._ytvideo(orig[8:])
         elif cmd.startswith("digitar ") or cmd.startswith("digite "):
-            if cmd.startswith("digitar "):
-                self._type(orig[8:])
-            else:
-                self._type(orig[7:])
+            self._type(orig[8:] if cmd.startswith("digitar ") else orig[7:])
         elif cmd == "limpar" or cmd == "cls":
             self.app.clear()
         elif cmd == "ajuda" or cmd == "help" or cmd == "?":
             self._helpcmd(cmd)
         else:
             self.app.say("Comando direto não reconhecido.")
-        
-        # Executa hooks post_command
+
         self.addon_manager.execute_hooks('post_command', text)
         return True
 
@@ -763,13 +996,15 @@ class CommandRouter:
             return
 
         if action == "open":
-            self._open(data.get("target", ""))
-        elif action == "search":
+            # Decisão da IA → permite abrir qualquer tipo de arquivo
+            self._open(data.get("target", ""), is_ai_driven=True)
+            return
+
+        if action == "search":
             self._search(data.get("query", ""))
         elif action == "youtube":
             self._youtube(data.get("query", ""))
         elif action == "ytvideo":
-            # AI may put query in different fields; try common ones
             q = data.get("query") or data.get("target") or data.get("text") or ""
             self._ytvideo(q)
         elif action == "type":
@@ -782,7 +1017,7 @@ class CommandRouter:
     def _helpcmd(self, cmd):
         help_text = (
             "Comandos disponíveis:\n"
-            "  /abrir [alvo] - Abre um aplicativo ou URL\n"
+            "  /abrir [alvo] - Abre um aplicativo, arquivo ou URL\n"
             "  /pesquisar [consulta] - Pesquisa no Google\n"
             "  /youtube [consulta] - Pesquisa no YouTube (suporta links)\n"
             "  /digitar [texto] - Digita o texto na janela alvo\n"
@@ -791,22 +1026,250 @@ class CommandRouter:
             "  /cancelar ou /parar - Cancela a resposta da IA\n"
             "  '/' só é necessário caso modelo IA esteja ativo.\n"
         )
-        
-        # Adiciona comandos dos addons
+
         if self.addon_manager.custom_commands:
             help_text += "\nComandos dos addons:\n"
             for cmd_name, cmd_info in self.addon_manager.custom_commands.items():
                 desc = cmd_info['description'] or "Sem descrição"
                 help_text += f"  /{cmd_name} - {desc}\n"
-        
+
         self.app.say(help_text)
+
+    def _normalize(self, value: str) -> str:
+        return _normalize_for_match(value)
+
+    def _candidate_desktop_dirs(self):
+        home = os.path.expanduser("~")
+        candidates = [
+            os.path.join(home, "Desktop"),
+            os.path.join(home, "Área de Trabalho"),
+            os.path.join(home, "OneDrive", "Desktop"),
+            os.path.join(home, "OneDrive", "Área de Trabalho"),
+        ]
+
+        seen = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if os.path.isdir(candidate):
+                yield candidate
+
+    def _read_shortcut_target(self, path: str) -> str:
+        """
+        Tenta ler o alvo de um atalho .lnk.
+        Se o módulo necessário não existir, apenas retorna string vazia.
+        """
+        if not path.lower().endswith(".lnk"):
+            return ""
+
+        try:
+            import win32com.client  # type: ignore
+            shell = win32com.client.Dispatch("WScript.Shell")
+            shortcut = shell.CreateShortcut(path)
+            return shortcut.Targetpath or ""
+        except Exception:
+            return ""
+
+    def _entry_display_names(self, full_path: str):
+        """
+        Retorna nomes que podem ser usados para bater com a busca:
+        - nome do arquivo sem extensão
+        - nome completo
+        - nome do alvo do atalho .lnk, quando possível
+        """
+        names = []
+
+        base = os.path.basename(full_path)
+        stem, ext = os.path.splitext(base)
+
+        if stem:
+            names.append(stem)
+
+        names.append(base)
+
+        if ext.lower() == ".lnk":
+            target = self._read_shortcut_target(full_path)
+            if target:
+                target_base = os.path.basename(target)
+                target_stem, _ = os.path.splitext(target_base)
+                if target_stem:
+                    names.append(target_stem)
+                if target_base:
+                    names.append(target_base)
+
+        return names
     
-    def _open(self, target):
+    def _desktop_entry_priority(self, path: str) -> int:
+        lower = path.lower()
+
+        # prioridade máxima: atalhos e executáveis
+        if lower.endswith(".lnk"):
+            return 0
+        if lower.endswith(".exe"):
+            return 1
+
+        # depois, outros arquivos
+        if os.path.isfile(path):
+            return 2
+
+        # por último, pastas
+        if os.path.isdir(path):
+            return 3
+
+        return 4
+
+
+    def _search_desktop_entries(self, target: str, allow_all_types: bool = False):
+        """
+        Busca entradas na área de trabalho.
+        Se allow_all_types=False: apenas .lnk e .exe (threshold padrão 0.65).
+        Se allow_all_types=True: primeiro tenta apenas .lnk/.exe com threshold relaxado (0.5);
+        se não encontrar, busca em todos os arquivos (imagens, docs etc.) com threshold normal.
+        """
+        target_norm = self._normalize(target)
+        if not target_norm:
+            return None
+
+        # Fase 1: sempre busca .lnk/.exe primeiro, com threshold adaptável
+        threshold_strict = 0.65
+        threshold_relaxed = 0.5
+        best_lnk_exe = None
+        best_lnk_exe_score = 0.0
+
+        for desktop in self._candidate_desktop_dirs():
+            for root, dirs, files in os.walk(desktop):
+                rel = os.path.relpath(root, desktop)
+                depth = 0 if rel == "." else rel.count(os.sep) + 1
+                if depth > 2:
+                    dirs[:] = []
+                    continue
+
+                # Avalia apenas .lnk e .exe
+                for entry in files:
+                    full_path = os.path.join(root, entry)
+                    ext = os.path.splitext(entry)[1].lower()
+                    if ext not in ('.lnk', '.exe'):
+                        continue
+
+                    candidates = self._entry_display_names(full_path)
+                    for candidate_name in candidates:
+                        candidate_norm = self._normalize(candidate_name)
+                        if not candidate_norm:
+                            continue
+
+                        # match exato ou substring => score máximo
+                        if target_norm == candidate_norm:
+                            score = 1.0
+                        elif target_norm in candidate_norm or candidate_norm in target_norm:
+                            score = 1.0
+                        else:
+                            score = difflib.SequenceMatcher(None, target_norm, candidate_norm).ratio()
+
+                        if score > best_lnk_exe_score:
+                            best_lnk_exe_score = score
+                            best_lnk_exe = full_path
+
+        # Se encontrou um .lnk/.exe com score aceitável (dependendo do modo)
+        if best_lnk_exe is not None:
+            threshold = threshold_relaxed if allow_all_types else threshold_strict
+            if best_lnk_exe_score >= threshold:
+                return best_lnk_exe
+            # Se allow_all_types=True e score abaixo do relaxado, não serve, continuamos para fallback amplo
+            if not allow_all_types:
+                # No modo restrito, se não atingiu threshold estrito, não retorna nada
+                return None
+
+        # Fase 2: fallback amplo, apenas se allow_all_types=True e não encontrou .lnk/.exe satisfatório
+        if not allow_all_types:
+            return None
+
+        # Busca em todos os arquivos e pastas, agora incluindo imagens, docs etc.
+        best_other = None
+        best_other_score = 0.0
+        best_other_priority = 99  # menor número = melhor
+
+        for desktop in self._candidate_desktop_dirs():
+            for root, dirs, files in os.walk(desktop):
+                rel = os.path.relpath(root, desktop)
+                depth = 0 if rel == "." else rel.count(os.sep) + 1
+                if depth > 2:
+                    dirs[:] = []
+                    continue
+
+                # Ordena entradas: atalhos/exe primeiro (mas agora é fallback, eles já foram testados), depois outros
+                ordered_entries = []
+                for entry in files:
+                    full_path = os.path.join(root, entry)
+                    ext = os.path.splitext(entry)[1].lower()
+                    if ext in ('.lnk', '.exe'):
+                        ordered_entries.append((0, full_path))
+                    else:
+                        ordered_entries.append((2, full_path))
+                for entry in dirs:
+                    full_path = os.path.join(root, entry)
+                    ordered_entries.append((3, full_path))
+
+                ordered_entries.sort(key=lambda x: x[0])
+
+                for priority, entry_path in ordered_entries:
+                    candidates = self._entry_display_names(entry_path)
+                    for candidate_name in candidates:
+                        candidate_norm = self._normalize(candidate_name)
+                        if not candidate_norm:
+                            continue
+
+                        if target_norm == candidate_norm:
+                            score = 1.0
+                        elif target_norm in candidate_norm or candidate_norm in target_norm:
+                            score = 1.0
+                        else:
+                            score = difflib.SequenceMatcher(None, target_norm, candidate_norm).ratio()
+
+                        # Prioridade menor é melhor; para mesma prioridade, maior score
+                        if priority < best_other_priority or (priority == best_other_priority and score > best_other_score):
+                            best_other_priority = priority
+                            best_other_score = score
+                            best_other = entry_path
+
+        # Threshold para arquivos não executáveis: mantemos 0.65
+        if best_other and best_other_score >= 0.65:
+            return best_other
+        return None
+
+    def _open_local_target(self, resolved_path: str) -> bool:
+        try:
+            if resolved_path.startswith(("http://", "https://")):
+                webbrowser.open(resolved_path)
+                return True
+
+            if os.path.exists(resolved_path):
+                try:
+                    os.startfile(resolved_path)
+                except Exception:
+                    subprocess.Popen(resolved_path, shell=True)
+                return True
+
+            subprocess.Popen(f'start "" {resolved_path}', shell=True)
+            return True
+        except Exception:
+            try:
+                webbrowser.open(resolved_path)
+                return True
+            except Exception:
+                return False
+
+    def _open(self, target, is_ai_driven: bool = False):
+        """
+        Abre um alvo (arquivo, atalho, URL).
+        - is_ai_driven=True: decisão veio da IA interpretando linguagem natural → permite qualquer tipo de arquivo.
+        - is_ai_driven=False (ex.: /abrir): só permite .lnk, .exe ou se extensão estiver em KNOWN_FILE_EXTENSIONS.
+        """
         if not target:
             self.app.say("Nada para abrir.")
             return
 
-        # novo: listar opções do apps.json quando usado "-?"
+        # Suporte ao comando "/abrir -?"
         if target.strip() == "-?":
             apps_path = os.path.join(os.path.dirname(__file__), "apps.json")
             try:
@@ -831,7 +1294,28 @@ class CommandRouter:
             self.app.say("\n".join(lines))
             return
 
-        # tenta carregar lista de apps de apps.json (mesmo diretório)
+        target_clean = target.strip()
+
+        # Determina se o usuário incluiu uma extensão conhecida (pedido explícito de arquivo)
+        _, ext = os.path.splitext(target_clean)
+        ext = ext.lower()
+        explicit_file_request = ext in self.KNOWN_FILE_EXTENSIONS
+
+        # Permite todos os tipos se for decisão da IA ou solicitação explícita por extensão
+        allow_all = is_ai_driven or explicit_file_request
+
+        # 1) Tenta encontrar na área de trabalho com o filtro apropriado
+        desktop_match = self._search_desktop_entries(target_clean, allow_all_types=allow_all)
+        if desktop_match:
+            if self._open_local_target(desktop_match):
+                display_name = os.path.basename(desktop_match)
+                self.app.say(f"Abrindo da área de trabalho: {display_name}")
+                return
+            else:
+                self.app.say(f"Erro ao abrir: {os.path.basename(desktop_match)}")
+                return
+
+        # 2) Tenta abrir via apps.json (apenas para atalhos/programas, sem restrições)
         apps_path = os.path.join(os.path.dirname(__file__), "apps.json")
         try:
             with open(apps_path, "r", encoding="utf-8") as f:
@@ -839,22 +1323,20 @@ class CommandRouter:
         except Exception:
             apps = []
 
-        target_clean = target.strip().lower()
-
+        target_lower = target_clean.lower()
         match = None
+
         if isinstance(apps, list) and apps:
             names = [a.get("name", "").lower() for a in apps]
-            # procura correspondência exata / substring
             for a in apps:
                 name = a.get("name", "").lower()
                 if not name:
                     continue
-                if target_clean == name or target_clean in name or name in target_clean:
+                if target_lower == name or target_lower in name or name in target_lower:
                     match = a
                     break
-            # tentativa fuzzy se nada encontrado
             if not match:
-                close = difflib.get_close_matches(target_clean, names, n=1, cutoff=0.6)
+                close = difflib.get_close_matches(target_lower, names, n=1, cutoff=0.6)
                 if close:
                     idx = names.index(close[0])
                     match = apps[idx]
@@ -865,42 +1347,37 @@ class CommandRouter:
                 self.app.say(f"Entrada inválida no apps.json para {match.get('name')}")
                 return
 
-            # se for URL, abre no navegador
-            if exec_cmd.startswith("http://") or exec_cmd.startswith("https://"):
-                webbrowser.open(exec_cmd)
-            else:
-                # se o caminho existir, usa os.startfile em Windows
-                try:
-                    if os.path.exists(exec_cmd):
-                        try:
-                            os.startfile(exec_cmd)
-                        except Exception:
-                            subprocess.Popen(exec_cmd, shell=True)
-                    else:
-                        # usa start para permitir .lnk ou associações
-                        subprocess.Popen(f'start "" {exec_cmd}', shell=True)
-                except Exception:
-                    # fallback final: tenta abrir como comando direto
-                    try:
-                        subprocess.Popen(exec_cmd, shell=True)
-                    except Exception as e:
-                        self.app.say(f"Erro ao executar entrada do apps.json: {e}")
-                        return
+            if not self._open_local_target(exec_cmd):
+                self.app.say(f"Erro ao executar entrada do apps.json: {match.get('name')}")
+                return
 
             self.app.say(f"Abrindo: {match.get('name')}")
             return
 
-        # fallback: comportamento atual (tenta abrir o target diretamente)
-        try:
-            subprocess.Popen(f'start "" {target}', shell=True)
-            self.app.say(f"Abrindo: {target}")
-        except Exception as e:
-            # se falhar, tenta abrir como URL
-            try:
-                webbrowser.open(target)
-                self.app.say(f"Abrindo URL: {target}")
-            except Exception:
-                self.app.say(f"Erro abrindo: {e}")
+        # 3) Tenta abrir diretamente o alvo como caminho/URL
+        #    Se allow_all for True, aceita qualquer coisa; se False, só tenta se parecer executável ou atalho
+        if allow_all:
+            if self._open_local_target(target_clean):
+                self.app.say(f"Abrindo: {target_clean}")
+                return
+            else:
+                self.app.say(f"Erro ao abrir: {target_clean}")
+                return
+        else:
+            # Sem permissão ampla, só tenta se for .lnk ou .exe detectado no nome
+            if ext in ('.lnk', '.exe'):
+                if self._open_local_target(target_clean):
+                    self.app.say(f"Abrindo: {target_clean}")
+                    return
+                else:
+                    self.app.say(f"Erro ao abrir: {target_clean}")
+                    return
+            else:
+                self.app.say(
+                    f"Não encontrei um programa ou atalho correspondente. "
+                    f"Para abrir outros arquivos, especifique a extensão (ex.: 'foto.jpg') ou peça diretamente ao JARVIS."
+                )
+                return
 
     def _search(self, query):
         webbrowser.open(f"https://www.google.com/search?q={query}")
@@ -912,8 +1389,6 @@ class CommandRouter:
             return
 
         q = query.strip()
-
-        # Detecta URL do YouTube (https://, http://, www., youtu.be)
         m = re.search(r"(https?://\S+|www\.\S+|youtu\.be/\S+)", q)
         if m:
             url = m.group(0)
@@ -923,14 +1398,10 @@ class CommandRouter:
             try:
                 parsed = urllib.parse.urlparse(url)
                 qs = urllib.parse.parse_qs(parsed.query)
-
-                # Playlist detectada por parâmetro list= ou path /playlist
                 if "list" in qs or "/playlist" in parsed.path:
                     webbrowser.open(url)
                     self.app.say(f"Abrindo playlist do YouTube: {url}")
                     return
-
-                # Vídeo direto (watch?v=... ou youtu.be/...)
                 webbrowser.open(url)
                 self.app.say(f"Abrindo YouTube: {url}")
                 return
@@ -938,7 +1409,6 @@ class CommandRouter:
                 self.app.say(f"Erro ao abrir link do YouTube: {e}")
                 return
 
-        # Se não for link, faz busca normal (usa quote_plus)
         qenc = urllib.parse.quote_plus(q)
         webbrowser.open(f"https://www.youtube.com/results?search_query={qenc}")
         self.app.say(f"Pesquisando no YouTube: {q}")
@@ -950,13 +1420,13 @@ class CommandRouter:
 
         q = query.strip()
         op_mode = False
-        # suporta prefixo para abrir direto o primeiro resultado
         if q.startswith("-op"):
             op_mode = True
             q = q[3:].strip()
         elif q.startswith("abrir"):
             op_mode = True
             q = q[5:].strip()
+
         if not q:
             self.app.say("Nada para pesquisar no YouTube.")
             return
@@ -968,7 +1438,6 @@ class CommandRouter:
             r.raise_for_status()
             html = r.text
 
-            # extrai até 4 ids de vídeo únicos
             ids = []
             idx = 0
             while len(ids) < 4:
@@ -993,20 +1462,17 @@ class CommandRouter:
                 self.app.say("Nenhum vídeo encontrado.")
                 return
 
-            # modo -op: abre direto o primeiro vídeo
             if op_mode:
                 first_url = f"https://www.youtube.com/watch?v={ids[0]}"
                 webbrowser.open(first_url)
                 self.app.say(f"Abrindo primeiro vídeo: {q}")
                 return
 
-            # caso normal: exibe até 4 opções clicáveis
             chat = self.app.chat
             chat.config(state="normal")
             chat.insert("end", f"Jarvis > Resultados para: {q}\n")
             for i, vid in enumerate(ids, start=1):
                 video_url = f"https://www.youtube.com/watch?v={vid}"
-                # tenta obter título via oEmbed
                 title = vid
                 try:
                     ourl = f"https://www.youtube.com/oembed?url={urllib.parse.quote_plus(video_url)}&format=json"
@@ -1024,14 +1490,14 @@ class CommandRouter:
                 chat.tag_config(tag, foreground=FG_COLOR, underline=True)
                 chat.tag_bind(tag, "<Button-1>", lambda e, u=video_url: webbrowser.open(u))
 
-            chat.insert("end", f"Jarvis > Clique no vídeo que desejar.\n")
+            chat.insert("end", "Jarvis > Clique no vídeo que desejar.\n")
             chat.see("end")
             chat.config(state="disabled")
         except Exception as e:
             self.app.say(f"Erro ao buscar vídeo: {e}")
 
     def _type(self, text):
-        self.app.say("Posicione o cursor sobre a janela alvo e mantenha-o parado por 1s (tempo limite 20s)...")
+        self.app.say("Posicione o cursor sobre a janela alvo e mantenha-o parado por 1s (tempo limite 20s).")
         timeout = 20.0
         idle_required = 1.0
         start_time = time.time()
@@ -1045,7 +1511,6 @@ class CommandRouter:
                 if idle_start is None:
                     idle_start = time.time()
                 elif time.time() - idle_start >= idle_required:
-                    # verifica se o cursor está sobre a janela do Jarvis; se sim, solicita nova seleção
                     try:
                         root = self.app.root
                         x0 = root.winfo_rootx()
@@ -1054,13 +1519,11 @@ class CommandRouter:
                         y1 = y0 + root.winfo_height()
                         if x0 <= pos[0] <= x1 and y0 <= pos[1] <= y1:
                             self.app.say("Cursor sobre a janela do Jarvis — posicione em outra janela.")
-                            # reinicia contagem para nova seleção
                             start_time = time.time()
                             last_pos = pyautogui.position()
                             idle_start = None
                             continue
                     except Exception:
-                        # se falhar ao obter geometria do Tk, prossegue normalmente
                         pass
                     break
             else:
@@ -1071,7 +1534,6 @@ class CommandRouter:
                 self.app.say("Tempo esgotado. Digitação cancelada.")
                 return
 
-        # traz foco para a janela sob o cursor e digita
         try:
             pyautogui.click(last_pos)
             self.app.say("Digitando em 0.5 segundos...")
@@ -1084,6 +1546,7 @@ class CommandRouter:
 # =========================
 # GUI (MODIFICADA PARA ADDONS)
 # =========================
+
 class JarvisApp:
     def __init__(self):
         # Inicializa o gerenciador de addons primeiro (sem carregar ainda)
@@ -1093,6 +1556,7 @@ class JarvisApp:
         self.addon_manager.execute_hooks('pre_init')
         
         self.ai = AIEngine()
+        self.knowledge_provider = BrowserKnowledgeProvider()
         self.router = None  # Será inicializado depois
         
         # Inicializa sistema de voz
@@ -1116,7 +1580,7 @@ class JarvisApp:
         self._ai_thinking = False
 
         print(f"[JARVIS][AI] inicializado. available={self.ai.available}, initially_available={self._ai_initially_available}")
- 
+
         self.root = tk.Tk()
         self.root.title(APP_NAME)
         self.root.geometry("560x380")
@@ -1128,7 +1592,30 @@ class JarvisApp:
             self.root.attributes("-topmost", True)
         except Exception:
             pass
+        
+        
+        def research_with_context(self, query: str) -> str:
+            if not self.browser:
+                return ""
 
+            search_term = f"{query.strip()} wikipedia"
+            try:
+                results = self.browser.search(search_term, language="pt-BR")
+                if not results:
+                    return ""
+
+                # prioriza resultado da Wikipédia
+                selected = next(
+                    (r for r in results if "wikipedia.org" in r.url.lower()),
+                    results[0]
+                )
+
+                text = self.browser.export_text(selected.url)
+                return text.strip()
+            except Exception as e:
+                print(f"[JARVIS] Erro ao pesquisar com PYbrowser: {e}")
+                return ""
+        
         # minimize -> send to system tray (pystray) or fallback to iconify
         def _quit_from_tray():
             try:
@@ -1756,7 +2243,7 @@ class JarvisApp:
 
         # initial messages
         if self.ai.available == True:
-            self.say("JARVIS online. Digite um comando ou mensagem.")
+            self.say("JARVIS online. Digite um comando, peça uma pesquisa ou faça uma solicitação.")
             if VOICE_AVAILABLE and self.voice_system:
                 self.say("Pressione CTRL+ALT+V para falar.")
         else:
@@ -2110,175 +2597,190 @@ class JarvisApp:
         self.entry.delete(0, "end")
         self._print_user(text)
 
-        text_lower = text.lower()
-        
+        text_lower = text.lower().strip()
+
         # ============================================
-        # 1. PRIMEIRO: Verificar se é comando com /
+        # 1. PRIMEIRO: comandos com /
         # ============================================
         if text.startswith("/"):
             self.router.handle_direct(text)
-            # Executa hooks post_send
-            self.addon_manager.execute_hooks('post_send', text)
+            self.addon_manager.execute_hooks("post_send", text)
             return
-        
+
         # ============================================
-        # 2. SEGUNDO: Verificar direct keywords dos addons
+        # 2. SEGUNDO: direct keywords dos addons
         # ============================================
         if self.addon_manager.process_direct_keyword(text):
-            # Executa hooks post_send
-            self.addon_manager.execute_hooks('post_send', text)
+            self.addon_manager.execute_hooks("post_send", text)
             return
-        
+
         # ============================================
-        # 3. TERCEIRO: Verificar comandos diretos ORIGINAIS do JARVIS (sem barra)
+        # 3. TERCEIRO: comandos locais que não devem ir para a IA
         # ============================================
-        # Lista de comandos diretos originais do JARVIS
-        if text_lower == "limpar" or text_lower == "cls":
+        if text_lower in ("limpar", "cls"):
             self.clear()
-            self.addon_manager.execute_hooks('post_send', text)
+            self.addon_manager.execute_hooks("post_send", text)
             return
-        elif text_lower == "cancelar" or text_lower == "parar":
+
+        if text_lower in ("cancelar", "parar"):
             self.cancel_ai_response()
-            self.addon_manager.execute_hooks('post_send', text)
+            self.addon_manager.execute_hooks("post_send", text)
             return
-        elif text_lower == "ajuda" or text_lower == "help" or text_lower == "?":
+
+        if text_lower in ("ajuda", "help", "?"):
             self.router._helpcmd(text_lower)
-            self.addon_manager.execute_hooks('post_send', text)
+            self.addon_manager.execute_hooks("post_send", text)
             return
-        elif text_lower.startswith("abrir ") or text_lower.startswith("abra "):
-            if text_lower.startswith("abrir "):
-                self.router._open(text[6:])
-            else:
-                self.router._open(text[5:])
-            self.addon_manager.execute_hooks('post_send', text)
-            return
-        elif text_lower.startswith("pesquisar ") or text_lower.startswith("pesquise "):
-            if text_lower.startswith("pesquisar "):
-                self.router._search(text[10:])
-            else:
-                self.router._search(text[9:])
-            self.addon_manager.execute_hooks('post_send', text)
-            return
-        elif text_lower.startswith("youtube ") or text_lower.startswith("yt "):
-            if text_lower.startswith("youtube "):
-                self.router._youtube(text[8:])
-            else:
-                self.router._youtube(text[3:])
-            self.addon_manager.execute_hooks('post_send', text)
-            return
-        elif text_lower.startswith("digitar ") or text_lower.startswith("digite "):
-            if text_lower.startswith("digitar "):
-                self.router._type(text[8:])
-            else:
-                self.router._type(text[7:])
-            self.addon_manager.execute_hooks('post_send', text)
-            return
-        elif text_lower.startswith("ytvideo ") or text_lower.startswith("ytv ") or text_lower.startswith("vídeo ") or text_lower.startswith("o vídeo "):
-            if text_lower.startswith("ytvideo "):
-                self.router._ytvideo(text[8:])
-            elif text_lower.startswith("ytv "):
-                self.router._ytvideo(text[4:])
-            elif text_lower.startswith("vídeo "):
-                self.router._ytvideo(text[6:])
-            else:
-                self.router._ytvideo(text[8:])
-            self.addon_manager.execute_hooks('post_send', text)
-            return
-        
+
         # ============================================
-        # 4. QUARTO: Apenas se não for nenhum comando, tentar usar a IA
+        # 4. QUARTO: TUDO O RESTO VAI PARA A IA
+        #    A IA decide se vai:
+        #    - pesquisar via PYbrowser
+        #    - abrir app
+        #    - digitar
+        #    - responder normalmente
         # ============================================
-        # ATENÇÃO: Agora ativamos a IA mesmo estando na bandeja
-        # Mas primeiro garantimos que a IA está realmente conectada - APENAS se estava disponível inicialmente
         if hasattr(self, "_ai_was_available") and self._ai_was_available and not self.ai.available:
-            # SÓ reativa se a IA estava disponível inicialmente
             if self._ai_initially_available:
                 self.ai.available = self._ai_was_available
                 try:
                     del self._ai_was_available
-                except:
+                except Exception:
                     pass
                 print(f"[JARVIS][AI] IA reativada (ainda na bandeja). available={self.ai.available}")
             else:
-                print(f"[JARVIS][AI] Ignorando reativação: IA não estava disponível inicialmente")
-        
-        # AGORA: Sempre verifica a conexão antes de tentar usar a IA - APENAS se estava disponível inicialmente
+                print("[JARVIS][AI] Ignorando reativação: IA não estava disponível inicialmente")
+
         if not self.ai.available:
-            # Tenta reconectar uma última vez - APENAS se estava disponível inicialmente
             if self._ai_initially_available:
                 if self._reconnect_ollama():
-                    print(f"[JARVIS][AI] Reconexão bem-sucedida!")
+                    print("[JARVIS][AI] Reconexão bem-sucedida!")
                 else:
-                    # MENSAGEM CORRIGIDA: Incluir comandos dos addons
-                    mensagem_comandos = "Modelo local indisponível. Para comandos, comece por: abrir, pesquisar, youtube, digitar, limpar, ajuda, ?"
-                    
-                    # Adicionar comandos dos addons se existirem (corrigindo a formatação)
+                    mensagem_comandos = (
+                        "Modelo local indisponível. "
+                        "Para comandos, use: /abrir, /pesquisar, /youtube, /digitar, /limpar, /ajuda"
+                    )
+
                     if self.addon_manager.custom_commands:
-                        addon_cmds = ", " + ", ".join([f"/{cmd}" for cmd in self.addon_manager.custom_commands.keys()])
-                        mensagem_comandos += addon_cmds
-                    
-                    # Adicionar direct keywords dos addons (corrigindo a formatação)
-                    if hasattr(self.addon_manager, 'direct_keyword_handlers') and self.addon_manager.direct_keyword_handlers:
+                        addon_cmds = ", ".join([f"/{cmd}" for cmd in self.addon_manager.custom_commands.keys()])
+                        mensagem_comandos += f". Comandos dos addons: {addon_cmds}"
+
+                    if hasattr(self.addon_manager, "direct_keyword_handlers") and self.addon_manager.direct_keyword_handlers:
                         direct_keys = list(self.addon_manager.direct_keyword_handlers.keys())
-                        if direct_keys:  # Verifica se não está vazio
-                            direct_cmds = ", " + ", ".join(direct_keys)
-                            mensagem_comandos += f". Ou use direto:{direct_cmds}"
-                    
-                    self.say(mensagem_comandos + ".")
-                    # Executa hooks post_send
-                    self.addon_manager.execute_hooks('post_send', text)
+                        if direct_keys:
+                            mensagem_comandos += f". Direct keywords: {', '.join(direct_keys)}"
+
+                    self.say(mensagem_comandos)
+                    self.addon_manager.execute_hooks("post_send", text)
                     return
             else:
-                # Mesma mensagem corrigida para quando IA não estava disponível inicialmente
-                mensagem_comandos = "Modelo local indisponível. Para comandos, comece por: abrir, pesquisar, youtube, digitar, limpar, ajuda, ?"
-                
+                mensagem_comandos = (
+                    "Modelo local indisponível. "
+                    "Para comandos, use: /abrir, /pesquisar, /youtube, /digitar, /limpar, /ajuda"
+                )
+
                 if self.addon_manager.custom_commands:
-                    addon_cmds = ", " + ", ".join([f"/{cmd}" for cmd in self.addon_manager.custom_commands.keys()])
-                    mensagem_comandos += addon_cmds
-                
-                if hasattr(self.addon_manager, 'direct_keyword_handlers') and self.addon_manager.direct_keyword_handlers:
+                    addon_cmds = ", ".join([f"/{cmd}" for cmd in self.addon_manager.custom_commands.keys()])
+                    mensagem_comandos += f". Comandos dos addons: {addon_cmds}"
+
+                if hasattr(self.addon_manager, "direct_keyword_handlers") and self.addon_manager.direct_keyword_handlers:
                     direct_keys = list(self.addon_manager.direct_keyword_handlers.keys())
-                    if direct_keys:  # Verifica se não está vazio
-                        direct_cmds = ", " + ", ".join(direct_keys)
-                        mensagem_comandos += f". Ou use direto:{direct_cmds}"
-                
-                self.say(mensagem_comandos + ".")
-                # Executa hooks post_send
-                self.addon_manager.execute_hooks('post_send', text)
+                    if direct_keys:
+                        mensagem_comandos += f". Direct keywords: {', '.join(direct_keys)}"
+
+                self.say(mensagem_comandos)
+                self.addon_manager.execute_hooks("post_send", text)
                 return
 
         # Reseta flag de cancelamento antes de iniciar nova resposta
         self._ai_cancelled = False
-        
+
         threading.Thread(
             target=self._handle_ai,
             args=(text,),
             daemon=True
         ).start()
 
+        self.addon_manager.execute_hooks("post_send", text)
+
+
     def _handle_ai(self, text):
         streamed = False
         cancelled = False
-        
+
         try:
-            # VERIFICAÇÃO CRÍTICA: A IA deve estar disponível
             if not self.ai.available:
                 print(f"[JARVIS][AI] ERRO: IA não disponível para processar: '{text}'")
                 self.root.after(0, lambda: self.say("IA não disponível no momento. Tente novamente."))
                 return
-            
+
             print(f"[JARVIS][AI] Processando pergunta: '{text}'")
-            
-            # Prepara a UI para streaming
+            plan = self.ai.plan(text)
+            action = (plan.get("action") or "chat").lower().strip()
+
+            if action in {"open", "search", "youtube", "ytvideo", "type", "clear"}:
+                print(f"[JARVIS][AI] Plano de ação: {action} -> {plan}")
+                self.root.after(0, lambda p=plan: self.router.execute(p))
+                return
+
+            context = ""
+            if action == "research":
+                query = (plan.get("query") or plan.get("context_query") or text).strip()
+                self.root.after(0, self.start_thinking)
+                self.root.after(0, self.restore_from_tray_or_minimal)
+                time.sleep(0.3)
+                self.root.after(0, self.start_response_stream)
+
+                def on_token(token):
+                    if getattr(self, "_ai_cancelled", False):
+                        return False
+                    try:
+                        self.root.after(0, lambda t=token: self.append_response_token(t))
+                    except Exception:
+                        pass
+                    return True
+
+                try:
+                    if self.knowledge_provider and self.knowledge_provider.has_context():
+                        kb = self.knowledge_provider.find_wikipedia_context(query)
+                        context = kb.get("text", "") or ""
+                        source_title = kb.get("title", "") or query
+                        source_url = kb.get("url", "") or ""
+                        if context:
+                            print(f"[JARVIS][PYbrowser] Contexto obtido de: {source_url}")
+                            context = (
+                                f"Título da fonte: {source_title}\n"
+                                f"URL: {source_url}\n\n"
+                                f"{context}"
+                            )
+                        else:
+                            print(f"[JARVIS][PYbrowser] Nenhum contexto extraído para: {query}")
+                    else:
+                        context = ""
+                except Exception as e:
+                    print(f"[JARVIS][PYbrowser] Falha ao buscar contexto: {e}")
+                    context = ""
+
+                try:
+                    self.ai.stream_chat(text, on_token, context=context)
+                    streamed = True
+                except Exception as e:
+                    print(f"[JARVIS][AI] Erro ao responder com contexto: {e}")
+                    streamed = False
+                finally:
+                    try:
+                        self.root.after(0, self.end_response_stream)
+                    except Exception:
+                        pass
+                    try:
+                        self.root.after(0, self.stop_thinking)
+                    except Exception:
+                        pass
+                return
+
             self.root.after(0, self.start_thinking)
-            
-            # Restaura a janela ANTES de fazer qualquer requisição
             self.root.after(0, self.restore_from_tray_or_minimal)
-            
-            # Pequena pausa para garantir que a janela foi restaurada
             time.sleep(0.3)
-            
-            # Inicia a resposta
             self.root.after(0, self.start_response_stream)
 
             def on_token(token):
@@ -2290,58 +2792,12 @@ class JarvisApp:
                     pass
                 return True
 
-            # Tenta streaming primeiro
             try:
                 print(f"[JARVIS][AI] Iniciando streaming para: '{text}'")
                 print(f"[JARVIS][AI] URL: {self.ai.url}, Modelo: {self.ai.model}")
-                
-                messages = [
-                    {"role": "system", "content": JARVIS_PERSONALITY},
-                    {"role": "user", "content": text}
-                ]
-
-                payload = {
-                    "model": self.ai.model,
-                    "messages": messages,
-                    "stream": True,
-                    "options": {
-                        "temperature": 0.7
-                    }
-                }
-
-                print(f"[JARVIS][AI] Enviando requisição...")
-                with requests.post(self.ai.url, json=payload, stream=True, timeout=30) as r:
-                    r.raise_for_status()
-                    print(f"[JARVIS][AI] Resposta recebida, status: {r.status_code}")
-                    
-                    for line in r.iter_lines():
-                        if not line:
-                            continue
-                        if self._ai_cancelled:
-                            cancelled = True
-                            break
-                        
-                        line_str = line.decode('utf-8')
-                        try:
-                            data = json.loads(line_str)
-                            token = data.get("message", {}).get("content", "")
-                            if token:
-                                if not on_token(token):
-                                    cancelled = True
-                                    break
-                        except json.JSONDecodeError as e:
-                            print(f"[JARVIS][AI] Erro ao decodificar JSON: {e}, linha: {line_str}")
-                            continue
-                
+                self.ai.stream_chat(text, on_token)
                 streamed = True
                 print(f"[JARVIS][AI] Streaming concluído com sucesso")
-                
-            except requests.exceptions.ConnectionError as e:
-                print(f"[JARVIS][AI] Erro de conexão: {e}")
-                # Marca IA como indisponível - APENAS se estava disponível inicialmente
-                if self._ai_initially_available:
-                    self.ai.available = False
-                streamed = False
             except requests.exceptions.Timeout as e:
                 print(f"[JARVIS][AI] Timeout: {e}")
                 streamed = False
@@ -2351,13 +2807,13 @@ class JarvisApp:
                     streamed = False
                 else:
                     cancelled = True
-                    
+
         except Exception as e:
             print(f"[JARVIS][AI] Erro geral no _handle_ai: {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
             streamed = False
-            
+
         finally:
             if streamed and not cancelled:
                 try:
@@ -2381,19 +2837,19 @@ class JarvisApp:
                     pass
                 return
 
-        # Fallback: método síncrono (sem streaming)
+
         print(f"[JARVIS][AI] Tentando fallback síncrono...")
-        
+
         if self._ai_cancelled:
             self.root.after(0, lambda: self.say("Resposta cancelada."))
             self.root.after(0, self.stop_thinking)
             return
-            
+
         try:
             print(f"[JARVIS][AI] Chamando ai.decide()...")
             decision = self.ai.decide(text)
             print(f"[JARVIS][AI] Resposta do decide(): {decision}")
-            
+
             if not self._ai_cancelled:
                 if decision.get("action") == "chat":
                     response = decision.get("response", "")
@@ -2412,7 +2868,7 @@ class JarvisApp:
             if not self._ai_cancelled:
                 self.root.after(0, lambda: self.say(f"Erro ao processar sua solicitação: {type(e).__name__}"))
             else:
-                self.root.after(0, lambda: self.say("Resposta cancelada."))       
+                self.root.after(0, lambda: self.say("Resposta cancelada."))
         finally:
             try:
                 self.root.after(0, self.stop_thinking)
