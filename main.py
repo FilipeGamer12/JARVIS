@@ -11,6 +11,10 @@ import os
 import difflib
 import urllib.parse
 import re
+import sys
+import importlib.util
+import traceback
+from typing import Dict, List, Any, Optional
 try:
     import pystray
     from PIL import Image, ImageDraw
@@ -51,6 +55,8 @@ ENTRY_BG = "#0b1020"
 FONT_MAIN = ("Consolas", 11)
 FONT_TITLE = ("Consolas", 16, "bold")
 
+ADDON_DIRECT_KEYWORDS = {}
+
 # =========================
 # SEGURANÇA
 # =========================
@@ -78,6 +84,188 @@ Não utilize emogis
 
 Seja educado, formal e objetivo nas respostas, evite pensar demais sem necessidade real
 """
+
+# =========================
+# SISTEMA DE ADDONS
+# =========================
+class AddonManager:
+    """Gerencia o carregamento e execução de addons"""
+    
+    def __init__(self, jarvis_app):
+        self.jarvis = jarvis_app
+        self.addons: Dict[str, Any] = {}
+        self.loaded_addons: List[str] = []
+        self.failed_addons: List[Dict[str, str]] = []
+        self.addon_direct_keywords = []
+        self.direct_keyword_handlers = {}
+        
+        # Hooks disponíveis para os addons
+        self.hooks = {
+            'pre_init': [],      # Executado antes da inicialização do Jarvis
+            'post_init': [],     # Executado após a inicialização do Jarvis
+            'pre_command': [],   # Executado antes de processar um comando
+            'post_command': [],  # Executado após processar um comando
+            'pre_send': [],      # Executado antes de enviar mensagem para IA
+            'post_send': [],     # Executado após enviar mensagem para IA
+            'pre_say': [],       # Executado antes de exibir mensagem no chat
+            'post_say': [],      # Executado após exibir mensagem no chat
+        }
+        
+        # Comandos registrados pelos addons
+        self.custom_commands: Dict[str, Dict] = {}
+        
+    def scan_addons(self) -> List[str]:
+        """Escaneia a pasta atual por arquivos addon_*.py"""
+        addon_files = []
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        for filename in os.listdir(current_dir):
+            if filename.startswith("addon_") and filename.endswith(".py"):
+                addon_path = os.path.join(current_dir, filename)
+                addon_files.append(addon_path)
+                
+        return addon_files
+    
+    def load_addon(self, addon_path: str) -> bool:
+        """Carrega um addon específico"""
+        try:
+            # Extrai nome do addon do arquivo
+            filename = os.path.basename(addon_path)
+            addon_name = filename[6:-3]  # Remove "addon_" e ".py"
+            
+            self.log(f"Carregando addon: {addon_name}")
+            
+            # Carrega o módulo
+            spec = importlib.util.spec_from_file_location(f"addon_{addon_name}", addon_path)
+            if spec is None:
+                raise ImportError(f"Não foi possível criar spec para {addon_name}")
+                
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[f"addon_{addon_name}"] = module
+            
+            # Define variáveis globais disponíveis para o addon
+            module.jarvis = self.jarvis
+            module.addon_manager = self
+            module.register_command = self.register_command
+            module.register_hook = self.register_hook
+            module.log = self.log
+            module.APP_NAME = APP_NAME
+            module.BG_COLOR = BG_COLOR
+            module.FG_COLOR = FG_COLOR
+            
+            # Executa o módulo
+            spec.loader.exec_module(module)
+            
+            # Verifica se o addon tem função setup
+            if hasattr(module, 'setup'):
+                module.setup(self.jarvis, self)
+                self.loaded_addons.append(addon_name)
+                self.addons[addon_name] = module
+                self.log(f"Addon '{addon_name}' carregado com sucesso!")
+                return True
+            else:
+                raise ImportError(f"Addon '{addon_name}' não tem função setup()")
+                
+        except Exception as e:
+            error_msg = f"Erro ao carregar addon {addon_path}: {str(e)}"
+            self.failed_addons.append({
+                'addon': os.path.basename(addon_path),
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            })
+            self.log(f"Falha ao carregar addon: {error_msg}", error=True)
+            return False
+    
+    def load_all_addons(self):
+        """Carrega todos os addons disponíveis"""
+        addon_files = self.scan_addons()
+        self.log(f"Encontrados {len(addon_files)} arquivos de addon")
+        
+        for addon_file in addon_files:
+            self.load_addon(addon_file)
+        
+        # Reporta status
+        if self.loaded_addons:
+            self.log(f"Addons carregados: {', '.join(self.loaded_addons)}")
+            # NOVO: Log dos comandos registrados
+            self.log_commands_status()
+        
+        if self.failed_addons:
+            for failed in self.failed_addons:
+                self.log(f"Falha no addon {failed['addon']}: {failed['error']}", error=True)
+    
+    def register_command(self, command: str, handler: callable, description: str = ""):
+        """Registra um novo comando para ser usado com /"""
+        if command in self.custom_commands:
+            self.log(f"Aviso: Comando '{command}' já registrado, substituindo")
+        
+        self.custom_commands[command] = {
+            'handler': handler,
+            'description': description
+        }
+        self.log(f"Comando '/{command}' registrado")
+    
+    def register_direct_keyword(self, keyword, handler):
+        """Registra uma nova direct keyword (sem barra)"""
+        if keyword in self.direct_keyword_handlers:
+            self.log(f"Aviso: Direct keyword '{keyword}' já registrada, substituindo")
+        
+        self.direct_keyword_handlers[keyword] = handler
+        self.log(f"Direct keyword '{keyword}' registrada")
+        
+    def process_direct_keyword(self, text):
+        """Processa uma direct keyword (comando sem barra)"""
+        # Converte para minúsculas para comparação
+        text_lower = text.lower().strip()
+        
+        # Procura por direct keywords registradas
+        for keyword, handler in self.direct_keyword_handlers.items():
+            # Verifica se o texto começa com a keyword
+            if text_lower == keyword or text_lower.startswith(keyword + " "):
+                try:
+                    # Chama o handler com o texto completo
+                    handler(text)
+                    return True  # Indica que processou com sucesso
+                except Exception as e:
+                    self.log(f"Erro ao processar direct keyword '{keyword}': {str(e)}", error=True)
+                    return False
+        
+        return False  # Nenhuma direct keyword encontrada
+    
+    def register_hook(self, hook_name: str, handler: callable):
+        """Registra um handler para um hook específico"""
+        if hook_name in self.hooks:
+            self.hooks[hook_name].append(handler)
+            self.log(f"Hook '{hook_name}' registrado")
+        else:
+            self.log(f"Aviso: Hook '{hook_name}' não existe")
+    
+    def execute_hooks(self, hook_name: str, *args, **kwargs) -> Any:
+        """Executa todos os handlers registrados para um hook"""
+        if hook_name not in self.hooks:
+            return None
+            
+        results = []
+        for handler in self.hooks[hook_name]:
+            try:
+                result = handler(*args, **kwargs)
+                if result is not None:
+                    results.append(result)
+            except Exception as e:
+                self.log(f"Erro no hook '{hook_name}': {str(e)}", error=True)
+        
+        return results
+    
+    def log(self, message: str, error: bool = False):
+        """Loga mensagens do addon manager"""
+        prefix = "[AddonManager] " if not error else "[AddonManager ERRO] "
+        print(f"{prefix}{message}")
+    
+    def log_commands_status(self):
+        """Loga o status dos comandos registrados"""
+        self.log(f"Comandos com barra registrados: {list(self.custom_commands.keys())}")
+        if hasattr(self, 'direct_keyword_handlers'):
+            self.log(f"Direct keywords registradas: {list(self.direct_keyword_handlers.keys())}")
 
 # =========================
 # SISTEMA DE VOZ
@@ -281,25 +469,59 @@ class VoiceSystem:
             
             # Salva o áudio
             write(temp_filename, self.sample_rate, (audio_data * 32767).astype(np.int16))
+            # Transcreve (com tratamento de erros explícito; tenta fallback sem ffmpeg)
+            try:
+                result = self.model.transcribe(
+                    temp_filename,
+                    language="pt",
+                    fp16=False,
+                    task="transcribe"
+                )
+                texto = result.get("text", "").strip()
+            except FileNotFoundError as e:
+                # Provavelmente o executável ffmpeg não foi encontrado.
+                print(f"Erro ao transcrever (arquivo não encontrado): {e}")
+                traceback.print_exc()
+                # Tenta fallback: passar o array numpy diretamente ao modelo (evita chamada ao ffmpeg)
+                try:
+                    print("Tentando fallback passando numpy array diretamente para o modelo...")
+                    audio_arg = audio_data.flatten()
+                    result = self.model.transcribe(
+                        audio_arg,
+                        language="pt",
+                        fp16=False,
+                        task="transcribe"
+                    )
+                    texto = result.get("text", "").strip()
+                    print("Fallback de transcrição bem-sucedido.")
+                except Exception as e2:
+                    print(f"Fallback falhou: {e2}")
+                    traceback.print_exc()
+                    self.jarvis.say("Executável necessário não encontrado (ex: ffmpeg). Instale o ffmpeg e tente novamente.")
+                    try:
+                        os.unlink(temp_filename)
+                    except Exception:
+                        pass
+                    return
+            except Exception as e:
+                print(f"Erro ao transcrever: {e}")
+                traceback.print_exc()
+                self.jarvis.say(f"Erro ao transcrever: {type(e).__name__}: {e}")
+                try:
+                    os.unlink(temp_filename)
+                except Exception:
+                    pass
+                return
 
-            # Transcreve
-            result = self.model.transcribe(
-                temp_filename,
-                language="pt",
-                fp16=False,
-                task="transcribe"
-            )
-            
-            texto = result["text"].strip()
             # REMOVER apenas ! ? , mantendo acentos
             texto = re.sub(r'[!,]', '', texto)
-            
+
             # Remove arquivo temporário
             try:
                 os.unlink(temp_filename)
-            except:
+            except Exception:
                 pass
-            
+
             # Envia texto para o chat
             if texto:
                 self.jarvis.root.after(0, self.jarvis.process_voice_input, texto)
@@ -342,7 +564,7 @@ def clean_query(text: str, remove_words):
 class AIEngine:
     def __init__(self, url: str = None, model: str = None):
         base_url = url or os.getenv("OLLAMA_URL") or "http://localhost:11434/api/chat"
-        self.model = model or os.getenv("OLLAMA_MODEL") or "deepseek-r1:8b"
+        self.model = model or os.getenv("OLLAMA_MODEL") or "qwen2.5-coder:3b"
 
         parsed = urllib.parse.urlparse(base_url)
         scheme = parsed.scheme or "http"
@@ -451,11 +673,12 @@ class AIEngine:
             on_token(f"\n[Erro IA: {e}]")
 
 # =========================
-# COMMAND ROUTER
+# COMMAND ROUTER (MODIFICADO PARA ADDONS)
 # =========================
 class CommandRouter:
     def __init__(self, app):
         self.app = app
+        self.addon_manager = app.addon_manager
 
     def handle_direct(self, text: str) -> bool:
         if not is_safe_command(text):
@@ -466,10 +689,31 @@ class CommandRouter:
         orig = text[1:].strip()
         cmd = orig.lower()
 
+        # Executa hooks pre_command
+        hook_results = self.addon_manager.execute_hooks('pre_command', text)
+        for result in hook_results:
+            if result is True:  # Se um hook retornar True, interrompe o processamento
+                return True
+
         # Comando para cancelar resposta da IA
         if cmd in ["cancelar", "parar"]:
             self.app.cancel_ai_response()
             return True
+
+        # Verifica se é um comando de addon
+        cmd_parts = cmd.split()
+        if cmd_parts and cmd_parts[0] in self.addon_manager.custom_commands:
+            addon_cmd = self.addon_manager.custom_commands[cmd_parts[0]]
+            try:
+                # Chama o handler do addon
+                if len(cmd_parts) > 1:
+                    addon_cmd['handler'](' '.join(cmd_parts[1:]))
+                else:
+                    addon_cmd['handler']('')
+                return True
+            except Exception as e:
+                self.app.say(f"Erro ao executar comando do addon: {str(e)}")
+                return True
 
         if cmd.startswith("abrir ") or cmd.startswith("abra "):
             if cmd.startswith("abrir "):
@@ -506,6 +750,9 @@ class CommandRouter:
             self._helpcmd(cmd)
         else:
             self.app.say("Comando direto não reconhecido.")
+        
+        # Executa hooks post_command
+        self.addon_manager.execute_hooks('post_command', text)
         return True
 
     def execute(self, data: dict):
@@ -534,16 +781,24 @@ class CommandRouter:
 
     def _helpcmd(self, cmd):
         help_text = (
-                "Comandos disponíveis:\n"
-                "  /abrir [alvo] - Abre um aplicativo ou URL\n"
-                "  /pesquisar [consulta] - Pesquisa no Google\n"
-                "  /youtube [consulta] - Pesquisa no YouTube (suporta links)\n"
-                "  /digitar [texto] - Digita o texto na janela alvo\n"
-                "  /limpar ou /cls - Limpa o chat\n"
-                "  /ytvideo [consulta] - Pesquisa avançada de vídeos no YouTube\n"
-                "  /cancelar ou /parar - Cancela a resposta da IA\n"
-                "  '/' só é necessário caso modelo IA esteja ativo.\n"
-            )
+            "Comandos disponíveis:\n"
+            "  /abrir [alvo] - Abre um aplicativo ou URL\n"
+            "  /pesquisar [consulta] - Pesquisa no Google\n"
+            "  /youtube [consulta] - Pesquisa no YouTube (suporta links)\n"
+            "  /digitar [texto] - Digita o texto na janela alvo\n"
+            "  /limpar ou /cls - Limpa o chat\n"
+            "  /ytvideo [consulta] - Pesquisa avançada de vídeos no YouTube\n"
+            "  /cancelar ou /parar - Cancela a resposta da IA\n"
+            "  '/' só é necessário caso modelo IA esteja ativo.\n"
+        )
+        
+        # Adiciona comandos dos addons
+        if self.addon_manager.custom_commands:
+            help_text += "\nComandos dos addons:\n"
+            for cmd_name, cmd_info in self.addon_manager.custom_commands.items():
+                desc = cmd_info['description'] or "Sem descrição"
+                help_text += f"  /{cmd_name} - {desc}\n"
+        
         self.app.say(help_text)
     
     def _open(self, target):
@@ -827,18 +1082,27 @@ class CommandRouter:
             self.app.say(f"Erro ao digitar: {e}")
 
 # =========================
-# GUI
+# GUI (MODIFICADA PARA ADDONS)
 # =========================
 class JarvisApp:
     def __init__(self):
+        # Inicializa o gerenciador de addons primeiro (sem carregar ainda)
+        self.addon_manager = AddonManager(self)
+        
+        # Executa hooks de pré-inicialização
+        self.addon_manager.execute_hooks('pre_init')
+        
         self.ai = AIEngine()
-        self.router = CommandRouter(self)
+        self.router = None  # Será inicializado depois
         
         # Inicializa sistema de voz
         self.voice_system = None
         if VOICE_AVAILABLE:
             self.voice_system = VoiceSystem(self)
 
+        # CRÍTICO: Salvar se a IA estava disponível NO INÍCIO
+        self._ai_initially_available = self.ai.available
+        
         # Intervalo de checagem de presença
         self._presence_interval = 60 if not self.ai.available else 1
         self._paused = False
@@ -851,7 +1115,7 @@ class JarvisApp:
         # Flag para controlar se a IA está pensando
         self._ai_thinking = False
 
-        print(f"[JARVIS][AI] inicializado. available={self.ai.available}")
+        print(f"[JARVIS][AI] inicializado. available={self.ai.available}, initially_available={self._ai_initially_available}")
  
         self.root = tk.Tk()
         self.root.title(APP_NAME)
@@ -879,20 +1143,22 @@ class JarvisApp:
 
         def _restore_from_tray():
             try:
-                # Restaura estado da IA
-                if hasattr(self, "_ai_was_available"):
-                    try:
-                        self.ai.available = self._ai_was_available
-                        # TENTA RECONECTAR COM O OLLAMA
-                        self._reconnect_ollama()
-                    except Exception:
-                        pass
+                # Restaura estado da IA APENAS se ela estava disponível inicialmente
+                if hasattr(self, "_ai_was_available") and self._ai_was_available and not self.ai.available:
+                    # SÓ reativa se a IA estava disponível inicialmente
+                    if self._ai_initially_available:
+                        try:
+                            self.ai.available = self._ai_was_available
+                            # Tenta reconectar com o Ollama
+                            self._reconnect_ollama()
+                        except Exception:
+                            pass
                     try:
                         del self._ai_was_available
                     except Exception:
                         pass
                 
-                print(f"[JARVIS][AI] retornando da bandeja. available={self.ai.available}")
+                print(f"[JARVIS][AI] retornando da bandeja. available={self.ai.available}, initially_available={self._ai_initially_available}")
 
                 try:
                     if hasattr(self, "_tray_icon") and self._tray_icon:
@@ -924,12 +1190,15 @@ class JarvisApp:
                 pass
 
         def _minimize_to_tray():
-            # Salva disponibilidade da IA
+            # Salva disponibilidade da IA APENAS se ela estava disponível inicialmente
             try:
-                self._ai_was_available = getattr(self.ai, "available", False)
-                # NÃO DESATIVA A IA COMPLETAMENTE, APENAS MARCA COMO DISPONÍVEL
-                # Isso evita problemas de reconexão
-                print(f"[JARVIS][AI] indo para a bandeja. previous_available={self._ai_was_available}")
+                if self._ai_initially_available:
+                    self._ai_was_available = getattr(self.ai, "available", False)
+                    # NÃO desativa a IA completamente, apenas salva o estado
+                    print(f"[JARVIS][AI] indo para a bandeja. previous_available={self._ai_was_available}")
+                else:
+                    # Se não estava disponível inicialmente, não salva nada
+                    print(f"[JARVIS][AI] indo para a bandeja (IA não estava disponível inicialmente)")
             except Exception:
                 pass
 
@@ -979,10 +1248,15 @@ class JarvisApp:
                     self.root.after(0, _restore_from_tray)
                 else:
                     if hasattr(self, "_ai_was_available"):
+                        # SÓ reativa se a IA estava disponível inicialmente
+                        if self._ai_initially_available:
+                            try:
+                                self.ai.available = self._ai_was_available
+                                self._reconnect_ollama()
+                                print(f"[JARVIS][AI] restaurado via taskbar. available={self.ai.available}")
+                            except Exception:
+                                pass
                         try:
-                            self.ai.available = self._ai_was_available
-                            self._reconnect_ollama()
-                            print(f"[JARVIS][AI] restaurado via taskbar. available={self.ai.available}")
                             del self._ai_was_available
                         except Exception:
                             pass
@@ -1470,6 +1744,15 @@ class JarvisApp:
 
         # keep previous bindings/behavior
         self.entry.bind("<Return>", self.send)
+        
+        # AGORA inicializa o router (depois que a interface foi construída)
+        self.router = CommandRouter(self)
+        
+        # AGORA carrega os addons (depois que a interface foi completamente construída)
+        self.addon_manager.load_all_addons()
+        
+        # Executa hooks de pós-inicialização
+        self.addon_manager.execute_hooks('post_init')
 
         # initial messages
         if self.ai.available == True:
@@ -1481,8 +1764,18 @@ class JarvisApp:
             if VOICE_AVAILABLE and self.voice_system:
                 self.say("Pressione CTRL+ALT+V para comandos por voz.")
 
+    # NOVO MÉTODO: Verifica se pode tentar reativar a IA
+    def _should_try_reactivate_ai(self):
+        """Retorna True apenas se a IA estava disponível inicialmente e agora não está"""
+        return self._ai_initially_available and not self.ai.available
+
     def _reconnect_ollama(self):
         """Tenta reconectar com o Ollama quando a janela é restaurada"""
+        # SÓ tenta reconectar se a IA estava disponível inicialmente
+        if not self._ai_initially_available:
+            print(f"[JARVIS][AI] IA não estava disponível inicialmente, ignorando reconexão")
+            return False
+            
         try:
             print(f"[JARVIS][AI] Tentando reconectar com Ollama...")
             # Testa a conexão com o Ollama
@@ -1529,7 +1822,12 @@ class JarvisApp:
             return False
 
     def restore_and_activate_ai(self):
-        """Reativa a IA se estiver desativada E tenta reconectar com Ollama"""
+        """Reativa a IA se estiver desativada - APENAS se estava disponível inicialmente"""
+        # SÓ reativa se a IA estava disponível inicialmente
+        if not self._ai_initially_available:
+            print(f"[JARVIS][AI] Ignorando reativação: IA não estava disponível inicialmente")
+            return
+            
         # Se a IA foi marcada como desativada (na bandeja), reativa
         if hasattr(self, "_ai_was_available") and self._ai_was_available and not self.ai.available:
             self.ai.available = self._ai_was_available
@@ -1539,8 +1837,9 @@ class JarvisApp:
                 pass
             print(f"[JARVIS][AI] IA reativada. available={self.ai.available}")
         
-        # SEMPRE tenta reconectar quando a janela é restaurada
-        self._reconnect_ollama()
+        # Tenta reconectar quando a janela é restaurada (apenas se estava disponível inicialmente)
+        if self._ai_initially_available:
+            self._reconnect_ollama()
 
     def cancel_ai_response(self):
         """Cancela a resposta da IA em andamento"""
@@ -1573,8 +1872,9 @@ class JarvisApp:
                 # Retoma tarefas de background
                 self.resume_background_tasks()
                 
-                # IMPORTANTE: Reconecta com o Ollama
-                self._reconnect_ollama()
+                # IMPORTANTE: Reconecta com o Ollama APENAS se estava disponível inicialmente
+                if self._ai_initially_available:
+                    self._reconnect_ollama()
                 
                 print("[JARVIS] Janela restaurada da bandeja.")
                 
@@ -1585,7 +1885,8 @@ class JarvisApp:
                     self.root.attributes("-topmost", True)
                     self.root.lift()
                     self.root.focus_force()
-                    self._reconnect_ollama()
+                    if self._ai_initially_available:
+                        self._reconnect_ollama()
                 except:
                     pass
         
@@ -1616,27 +1917,118 @@ class JarvisApp:
 
     def process_voice_input(self, text):
         """Processa texto de entrada por voz"""
-        # Primeiro, ativar a IA se necessário (antes de colocar no campo)
+        # Primeiro, ativar a IA se necessário - APENAS se estava disponível inicialmente
         if hasattr(self, "_ai_was_available") and self._ai_was_available and not self.ai.available:
-            self.ai.available = self._ai_was_available
-            try:
-                del self._ai_was_available
-            except:
-                pass
-            print(f"[JARVIS][AI] IA reativada por voz (ainda na bandeja). available={self.ai.available}")
+            # SÓ tenta reativar se a IA estava disponível inicialmente
+            if self._ai_initially_available:
+                self.ai.available = self._ai_was_available
+                try:
+                    del self._ai_was_available
+                except:
+                    pass
+                print(f"[JARVIS][AI] IA reativada por voz (ainda na bandeja). available={self.ai.available}")
+            else:
+                print(f"[JARVIS][AI] Ignorando reativação por voz: IA não estava disponível inicialmente")
+        
+        # Corrige o texto se for um comando de voz mal interpretado
+        corrected_text = self.correct_voice_command(text)
         
         # Coloca o texto no campo de entrada
         self.entry.delete(0, tk.END)
-        self.entry.insert(0, text)
+        self.entry.insert(0, corrected_text)
         
         # Simula pressionar Enter para enviar
         self.send()
 
+    def correct_voice_command(self, text):
+        """Corrige um comando de voz mal interpretado usando similaridade"""
+        if not text:
+            return text
+        
+        # Lista de comandos disponíveis para comparação
+        available_commands = []
+        
+        # 1. Comandos diretos (sem barra)
+        direct_commands = [
+            "limpar", "cls", "ajuda", "help", "?", "cancelar", "parar",
+            "abrir", "abra", "pesquisar", "pesquise", "youtube", "yt",
+            "digitar", "digite", "ytvideo", "ytv", "vídeo"
+        ]
+        
+        # 2. Comandos com barra (sem a barra)
+        slash_commands = [
+            "abrir", "pesquisar", "youtube", "digitar", "limpar", 
+            "ajuda", "ytvideo", "cancelar", "parar"
+        ]
+        
+        # 3. Adiciona comandos dos addons
+        if self.addon_manager.custom_commands:
+            slash_commands.extend(list(self.addon_manager.custom_commands.keys()))
+        
+        # 4. Adiciona direct keywords dos addons
+        if hasattr(self.addon_manager, 'direct_keyword_handlers'):
+            direct_commands.extend(list(self.addon_manager.direct_keyword_handlers.keys()))
+        
+        # Verifica se o texto já é um comando válido
+        text_lower = text.lower().strip()
+        
+        # Primeiro verifica se é um comando com barra
+        if text_lower.startswith("/"):
+            cmd = text_lower[1:].split()[0] if len(text_lower[1:].split()) > 0 else text_lower[1:]
+            if cmd in slash_commands:
+                return text  # Já é um comando válido
+        else:
+            # Verifica comandos diretos
+            first_word = text_lower.split()[0] if len(text_lower.split()) > 0 else text_lower
+            if first_word in direct_commands:
+                return text  # Já é um comando válido
+        
+        # Se não for um comando válido, procura o mais parecido
+        # Determina qual lista usar para comparação
+        if text_lower.startswith("/"):
+            # Comando com barra
+            cmd = text_lower[1:].split()[0] if len(text_lower[1:].split()) > 0 else text_lower[1:]
+            target_list = slash_commands
+            prefix = "/"
+        else:
+            # Comando direto
+            cmd = text_lower.split()[0] if len(text_lower.split()) > 0 else text_lower
+            target_list = direct_commands
+            prefix = ""
+        
+        # Encontra o comando mais parecido
+        closest = difflib.get_close_matches(cmd, target_list, n=1, cutoff=0.6)
+        
+        if closest:
+            closest_cmd = closest[0]
+            # Substitui o comando no texto
+            if text_lower.startswith("/"):
+                # Para comandos com barra
+                corrected = f"/{closest_cmd}" + text[len(prefix + cmd):]
+            else:
+                # Para comandos diretos
+                corrected = closest_cmd + text[len(cmd):]
+            
+            # Informa ao usuário sobre a correção
+            if text != corrected:
+                self.say(f"Comando corrigido: '{text}' -> '{corrected}'")
+            
+            return corrected
+        
+        return text  # Retorna o texto original se não encontrar correção
+
     def say(self, text):
+        """Exibe uma mensagem no chat (com suporte a hooks)"""
+        # Executa hooks pre_say
+        self.addon_manager.execute_hooks('pre_say', text)
+        
         self.chat.config(state="normal")
         self.chat.insert("end", f"Jarvis > {text}\n")
         self.chat.see("end")
         self.chat.config(state="disabled")
+        
+        # Executa hooks post_say
+        self.addon_manager.execute_hooks('post_say', text)
 
     def _print_user(self, text):
         self.chat.config(state="normal")
@@ -1719,42 +2111,140 @@ class JarvisApp:
         self._print_user(text)
 
         text_lower = text.lower()
-        direct_keywords = (
-            "abrir ", "abra ", "pesquisar ", "pesquise ",
-            "youtube ", "yt ", "digitar ", "digite ", "ajuda", "help", "?",
-            "ytvideo ", "ytv ", "vídeo ", "o vídeo "
-        )
-
-        # Comandos de cancelamento
-        if text_lower in ["cancelar", "parar"]:
-            self.cancel_ai_response()
-            return
-
-        # Trata comandos diretos
-        if text.startswith("/") or text_lower.startswith(direct_keywords) or text_lower in ("limpar", "cls"):
-            if text.startswith("/"):
-                self.router.handle_direct(text)
-            else:
-                self.router.handle_direct("/" + text)
-            return
-
-        # ATENÇÃO: Agora ativamos a IA mesmo estando na bandeja
-        # Mas primeiro garantimos que a IA está realmente conectada
-        if hasattr(self, "_ai_was_available") and self._ai_was_available and not self.ai.available:
-            self.ai.available = self._ai_was_available
-            try:
-                del self._ai_was_available
-            except:
-                pass
-            print(f"[JARVIS][AI] IA reativada (ainda na bandeja). available={self.ai.available}")
         
-        # AGORA: Sempre verifica a conexão antes de tentar usar a IA
-        if not self.ai.available:
-            # Tenta reconectar uma última vez
-            if self._reconnect_ollama():
-                print(f"[JARVIS][AI] Reconexão bem-sucedida!")
+        # ============================================
+        # 1. PRIMEIRO: Verificar se é comando com /
+        # ============================================
+        if text.startswith("/"):
+            self.router.handle_direct(text)
+            # Executa hooks post_send
+            self.addon_manager.execute_hooks('post_send', text)
+            return
+        
+        # ============================================
+        # 2. SEGUNDO: Verificar direct keywords dos addons
+        # ============================================
+        if self.addon_manager.process_direct_keyword(text):
+            # Executa hooks post_send
+            self.addon_manager.execute_hooks('post_send', text)
+            return
+        
+        # ============================================
+        # 3. TERCEIRO: Verificar comandos diretos ORIGINAIS do JARVIS (sem barra)
+        # ============================================
+        # Lista de comandos diretos originais do JARVIS
+        if text_lower == "limpar" or text_lower == "cls":
+            self.clear()
+            self.addon_manager.execute_hooks('post_send', text)
+            return
+        elif text_lower == "cancelar" or text_lower == "parar":
+            self.cancel_ai_response()
+            self.addon_manager.execute_hooks('post_send', text)
+            return
+        elif text_lower == "ajuda" or text_lower == "help" or text_lower == "?":
+            self.router._helpcmd(text_lower)
+            self.addon_manager.execute_hooks('post_send', text)
+            return
+        elif text_lower.startswith("abrir ") or text_lower.startswith("abra "):
+            if text_lower.startswith("abrir "):
+                self.router._open(text[6:])
             else:
-                self.say("Modelo local indisponível. Para comandos, comece por: abrir, pesquisar, youtube, digitar, limpar.")
+                self.router._open(text[5:])
+            self.addon_manager.execute_hooks('post_send', text)
+            return
+        elif text_lower.startswith("pesquisar ") or text_lower.startswith("pesquise "):
+            if text_lower.startswith("pesquisar "):
+                self.router._search(text[10:])
+            else:
+                self.router._search(text[9:])
+            self.addon_manager.execute_hooks('post_send', text)
+            return
+        elif text_lower.startswith("youtube ") or text_lower.startswith("yt "):
+            if text_lower.startswith("youtube "):
+                self.router._youtube(text[8:])
+            else:
+                self.router._youtube(text[3:])
+            self.addon_manager.execute_hooks('post_send', text)
+            return
+        elif text_lower.startswith("digitar ") or text_lower.startswith("digite "):
+            if text_lower.startswith("digitar "):
+                self.router._type(text[8:])
+            else:
+                self.router._type(text[7:])
+            self.addon_manager.execute_hooks('post_send', text)
+            return
+        elif text_lower.startswith("ytvideo ") or text_lower.startswith("ytv ") or text_lower.startswith("vídeo ") or text_lower.startswith("o vídeo "):
+            if text_lower.startswith("ytvideo "):
+                self.router._ytvideo(text[8:])
+            elif text_lower.startswith("ytv "):
+                self.router._ytvideo(text[4:])
+            elif text_lower.startswith("vídeo "):
+                self.router._ytvideo(text[6:])
+            else:
+                self.router._ytvideo(text[8:])
+            self.addon_manager.execute_hooks('post_send', text)
+            return
+        
+        # ============================================
+        # 4. QUARTO: Apenas se não for nenhum comando, tentar usar a IA
+        # ============================================
+        # ATENÇÃO: Agora ativamos a IA mesmo estando na bandeja
+        # Mas primeiro garantimos que a IA está realmente conectada - APENAS se estava disponível inicialmente
+        if hasattr(self, "_ai_was_available") and self._ai_was_available and not self.ai.available:
+            # SÓ reativa se a IA estava disponível inicialmente
+            if self._ai_initially_available:
+                self.ai.available = self._ai_was_available
+                try:
+                    del self._ai_was_available
+                except:
+                    pass
+                print(f"[JARVIS][AI] IA reativada (ainda na bandeja). available={self.ai.available}")
+            else:
+                print(f"[JARVIS][AI] Ignorando reativação: IA não estava disponível inicialmente")
+        
+        # AGORA: Sempre verifica a conexão antes de tentar usar a IA - APENAS se estava disponível inicialmente
+        if not self.ai.available:
+            # Tenta reconectar uma última vez - APENAS se estava disponível inicialmente
+            if self._ai_initially_available:
+                if self._reconnect_ollama():
+                    print(f"[JARVIS][AI] Reconexão bem-sucedida!")
+                else:
+                    # MENSAGEM CORRIGIDA: Incluir comandos dos addons
+                    mensagem_comandos = "Modelo local indisponível. Para comandos, comece por: abrir, pesquisar, youtube, digitar, limpar, ajuda, ?"
+                    
+                    # Adicionar comandos dos addons se existirem (corrigindo a formatação)
+                    if self.addon_manager.custom_commands:
+                        addon_cmds = ", " + ", ".join([f"/{cmd}" for cmd in self.addon_manager.custom_commands.keys()])
+                        mensagem_comandos += addon_cmds
+                    
+                    # Adicionar direct keywords dos addons (corrigindo a formatação)
+                    if hasattr(self.addon_manager, 'direct_keyword_handlers') and self.addon_manager.direct_keyword_handlers:
+                        direct_keys = list(self.addon_manager.direct_keyword_handlers.keys())
+                        if direct_keys:  # Verifica se não está vazio
+                            direct_cmds = ", " + ", ".join(direct_keys)
+                            mensagem_comandos += f". Ou use direto:{direct_cmds}"
+                    
+                    self.say(mensagem_comandos + ".")
+                    # Executa hooks post_send
+                    self.addon_manager.execute_hooks('post_send', text)
+                    return
+            else:
+                # Mesma mensagem corrigida para quando IA não estava disponível inicialmente
+                mensagem_comandos = "Modelo local indisponível. Para comandos, comece por: abrir, pesquisar, youtube, digitar, limpar, ajuda, ?"
+                
+                if self.addon_manager.custom_commands:
+                    addon_cmds = ", " + ", ".join([f"/{cmd}" for cmd in self.addon_manager.custom_commands.keys()])
+                    mensagem_comandos += addon_cmds
+                
+                if hasattr(self.addon_manager, 'direct_keyword_handlers') and self.addon_manager.direct_keyword_handlers:
+                    direct_keys = list(self.addon_manager.direct_keyword_handlers.keys())
+                    if direct_keys:  # Verifica se não está vazio
+                        direct_cmds = ", " + ", ".join(direct_keys)
+                        mensagem_comandos += f". Ou use direto:{direct_cmds}"
+                
+                self.say(mensagem_comandos + ".")
+                # Executa hooks post_send
+                self.addon_manager.execute_hooks('post_send', text)
                 return
 
         # Reseta flag de cancelamento antes de iniciar nova resposta
@@ -1848,8 +2338,9 @@ class JarvisApp:
                 
             except requests.exceptions.ConnectionError as e:
                 print(f"[JARVIS][AI] Erro de conexão: {e}")
-                # Marca IA como indisponível
-                self.ai.available = False
+                # Marca IA como indisponível - APENAS se estava disponível inicialmente
+                if self._ai_initially_available:
+                    self.ai.available = False
                 streamed = False
             except requests.exceptions.Timeout as e:
                 print(f"[JARVIS][AI] Timeout: {e}")
