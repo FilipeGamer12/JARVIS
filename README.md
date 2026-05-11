@@ -60,7 +60,7 @@ O código bloqueia alguns comandos com palavras potencialmente destrutivas, como
 ## Requisitos
 
 ### Obrigatórios
-- Python 3.10+ recomendado
+- Python 3.10-3.13 recomendado
 - Um servidor **Ollama** ativo localmente
 - Um modelo disponível no Ollama
 
