@@ -15,6 +15,7 @@ import sys
 import importlib.util
 import traceback
 import unicodedata
+import math
 from typing import Dict, List, Any, Optional
 try:
     import pystray
@@ -831,7 +832,7 @@ class AIEngine:
             "Responda SOMENTE com JSON válido, sem markdown e sem texto extra.\n\n"
             "Formato obrigatório:\n"
             "{\n"
-            '  "action": "chat|research|open|search|youtube|ytvideo|type|clear",\n'
+            '  "action": "chat|research|open|search|youtube|ytvideo|type|clear|math",\n'
             '  "target": "",\n'
             '  "query": "",\n'
             '  "text": "",\n'
@@ -844,6 +845,7 @@ class AIEngine:
             "- Se pedir YouTube, use action=\"youtube\" ou \"ytvideo\".\n"
             "- Se pedir para digitar, use action=\"type\" e text.\n"
             "- Se pedir para limpar, use action=\"clear\".\n"
+            "- Se for uma pergunta matemática, use action=\"math\" e coloque a expressão em query.\n"
             "- Caso contrário, use action=\"chat\".\n"
         )
 
@@ -1011,6 +1013,8 @@ class CommandRouter:
             self._type(data.get("text", ""))
         elif action == "clear":
             self.app.clear()
+        elif action == "math":
+            self._math(data.get("query", ""))
         else:
             self.app.say("Ação não reconhecida.")
 
@@ -1383,6 +1387,91 @@ class CommandRouter:
         webbrowser.open(f"https://www.google.com/search?q={query}")
         self.app.say(f"Pesquisando no Google: {query}")
 
+    def _math(self, expression):
+        import ast
+        import operator
+        import re
+
+        def _safe_eval(expr: str):
+            # Normaliza vírgula decimal apenas quando usada entre dígitos (ex.: 1,23 -> 1.23)
+            expr = re.sub(r'(?<=\d)\s*,\s*(?=\d)', '.', expr)
+
+            # Operadores permitidos
+            operators = {
+                ast.Add: operator.add,
+                ast.Sub: operator.sub,
+                ast.Mult: operator.mul,
+                ast.Div: operator.truediv,
+                ast.FloorDiv: operator.floordiv,
+                ast.Mod: operator.mod,
+                ast.Pow: operator.pow,
+            }
+            unary_operators = {
+                ast.UAdd: operator.pos,
+                ast.USub: operator.neg,
+            }
+
+            # Nomes (funções/constantes) permitidos (apenas do módulo math)
+            allowed_names = {k: v for k, v in math.__dict__.items() if not k.startswith("__")}
+            # Complementos seguros
+            allowed_names.update({"abs": abs, "round": round})
+
+            def _eval(node):
+                if isinstance(node, ast.Expression):
+                    return _eval(node.body)
+                if isinstance(node, ast.Constant):  # Python 3.8+
+                    if isinstance(node.value, (int, float, complex)):
+                        return node.value
+                    raise ValueError("Constante inválida")
+                if isinstance(node, ast.Num):  # type: ignore
+                    return node.n
+                if isinstance(node, ast.BinOp):
+                    left = _eval(node.left)
+                    right = _eval(node.right)
+                    op_type = type(node.op)
+                    if op_type in operators:
+                        return operators[op_type](left, right)
+                    raise ValueError("Operador não permitido")
+                if isinstance(node, ast.UnaryOp):
+                    operand = _eval(node.operand)
+                    op_type = type(node.op)
+                    if op_type in unary_operators:
+                        return unary_operators[op_type](operand)
+                    raise ValueError("Operador unário não permitido")
+                if isinstance(node, ast.Call):
+                    # Permite apenas chamadas simples por nome (ex.: sin(x))
+                    if not isinstance(node.func, ast.Name):
+                        raise ValueError("Chamada de função complexa não permitida")
+                    func_name = node.func.id
+                    if func_name not in allowed_names or not callable(allowed_names[func_name]):
+                        raise ValueError(f"Função '{func_name}' não permitida")
+                    if node.keywords:
+                        raise ValueError("Argumentos nomeados não permitidos")
+                    args = [_eval(a) for a in node.args]
+                    return allowed_names[func_name](*args)
+                if isinstance(node, ast.Name):
+                    if node.id in allowed_names:
+                        return allowed_names[node.id]
+                    raise ValueError(f"Nome '{node.id}' não permitido")
+                if isinstance(node, ast.Tuple):
+                    return tuple(_eval(e) for e in node.elts)
+                raise ValueError("Expressão não permitida")
+
+            parsed = ast.parse(expr, mode="eval")
+            return _eval(parsed)
+
+        try:
+            result = _safe_eval(expression)
+            # Formata saída numérica de forma legível
+            if isinstance(result, float):
+                out = f"{result:.10g}"
+            else:
+                out = str(result)
+            self.app.say(f"O resultado de {expression} é: {out}")
+        except Exception as e:
+            self.app.say(f"Erro ao calcular expressão: {e}")
+        JarvisApp.stop_thinking(self.app)
+    
     def _youtube(self, query):
         if not query:
             self.app.say("Nada para pesquisar no YouTube.")
@@ -2715,10 +2804,11 @@ class JarvisApp:
                 return
 
             print(f"[JARVIS][AI] Processando pergunta: '{text}'")
+            self.start_thinking()
             plan = self.ai.plan(text)
             action = (plan.get("action") or "chat").lower().strip()
 
-            if action in {"open", "search", "youtube", "ytvideo", "type", "clear"}:
+            if action in {"open", "search", "youtube", "ytvideo", "type", "clear", "math"}:
                 print(f"[JARVIS][AI] Plano de ação: {action} -> {plan}")
                 self.root.after(0, lambda p=plan: self.router.execute(p))
                 return
@@ -2793,6 +2883,7 @@ class JarvisApp:
                 return True
 
             try:
+                self.stop_thinking()
                 print(f"[JARVIS][AI] Iniciando streaming para: '{text}'")
                 print(f"[JARVIS][AI] URL: {self.ai.url}, Modelo: {self.ai.model}")
                 self.ai.stream_chat(text, on_token)
