@@ -1,3 +1,6 @@
+# ESSE ARQUIVO ESTÁ PARCIALMENTE OBSOLETO
+# O JARVIS FUNCIONA SEM ELE NO ESTADO ATUAL
+
 from pathlib import Path
 import json
 import sys
