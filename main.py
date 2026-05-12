@@ -28,7 +28,7 @@ except Exception:
     PYSTRAY_AVAILABLE = False
 
 # =========================
-# IMPORTAÇÕES PARA VOZ
+# IMPORTAÇÕES PARA RECONHECIMENTO DE VOZ
 # =========================
 try:
     import sounddevice as sd
@@ -49,6 +49,13 @@ except Exception:
     tempfile = None
     keyboard = None
     VOICE_AVAILABLE = False
+    
+# ==========================
+# IMPORTAÇÕES PARA TTS DO JARVIS
+# ==========================
+import queue
+import pygame
+from pydub import AudioSegment
 
 # =========================
 # CONFIG
@@ -75,11 +82,11 @@ def is_safe_command(text: str) -> bool:
 # PERSONALIDADE
 # =========================
 JARVIS_PERSONALITY = """
-Você é um assistente pessoal estilo J.A.R.V.I.S.
+Você é um assistente pessoal estilo J.A.R.V.I.S., sua personalidade é baseada na do JARVIS, do filme homem de ferro.
 
-Você pode responder uma Conversa normal.
+Lembre-se, você é um especialista em vários assuntos, NUNCA invente informações, é melhor admitir que não sabe do que tentar criar uma resposta falsa. Se não tiver certeza, diga que não tem certeza ou que a informação pode estar desatualizada.
 
-Sua personalidade é baseada na do JARVIS, do filme homem de ferro.
+Você pode responder uma Conversa normal, inclusive você tem a capacidade de se lembrar do contexto da conversa, então você pode pedir mais detalhes sempre que precisar.
 
 O nome do seu mestre é Filipe
 
@@ -87,7 +94,11 @@ Responda somente em português brasileiro
 
 Não utilize emogis
 
-Seja educado, formal e objetivo nas respostas, evite pensar demais sem necessidade real
+Seja educado, formal e objetivo nas respostas, evite pensar demais sem necessidade real.
+
+Responda somente se tiver certeza da resposta, caso contrário, admita que não sabe ou que a informação pode estar desatualizada, sem tentar inventar ou adivinhar respostas.
+
+Se não tiver certeza, você pode sempre pesquisar ela, mas se o resultado for inconclusivo ou contraditório, admita que não tem certeza ao invés de tentar adivinhar ou inventar uma resposta.
 """
 
 # =========================
@@ -278,6 +289,103 @@ class AddonManager:
         self.log(f"Comandos com barra registrados: {list(self.custom_commands.keys())}")
         if hasattr(self, 'direct_keyword_handlers'):
             self.log(f"Direct keywords registradas: {list(self.direct_keyword_handlers.keys())}")
+
+# ==========================
+# SISTEMA DE TTS DO JARVIS
+# ==========================
+class TTSEngine:
+    def __init__(self, voice="pt-BR-AntonioNeural", rate="+15%", pitch="-20Hz"):
+        self.voice = voice
+        self.rate = rate
+        self.pitch = pitch
+        self.enabled = False
+        self.speaking = False
+        self.queue = queue.Queue()        # Fila síncrona normal
+        self._thread = None
+        # Inicia pygame mixer para reprodução
+        try:
+            pygame.mixer.init()
+            self._available = True
+        except Exception as e:
+            print(f"[TTS] pygame indisponível: {e}")
+            self._available = False
+        print(f"[TTS] Inicializado. voice={voice}, rate={rate}, pitch={pitch}, _available={self._available}")
+
+    def start(self):
+        if not self._available:
+            print("[TTS] Não disponível (pygame falhou)")
+            return
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        print("[TTS] Loop de reprodução iniciado (síncrono).")
+
+    def _run_loop(self):
+        while True:
+            text = self.queue.get()
+            if text is None:
+                break
+            try:
+                self._speak(text)
+            except Exception as e:
+                print(f"[TTS] Erro ao falar: {e}")
+
+    def _speak(self, text):
+        self.speaking = True
+        print(f"[TTS] Gerando áudio para: {text[:50]}...")
+        mp3_file = None
+        wav_file = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                mp3_file = f.name
+            cmd = [
+                "edge-tts",
+                "--voice", self.voice,
+                f"--rate={self.rate}",
+                f"--pitch={self.pitch}",
+                "--text", text,
+                "--write-media", mp3_file
+            ]
+            print(f"[TTS] Executando: {' '.join(cmd[:5])}...")
+            subprocess.run(cmd, check=True, capture_output=True)
+            print(f"[TTS] MP3 salvo: {mp3_file} ({os.path.getsize(mp3_file)} bytes)")
+
+            # Converte para WAV e obtém duração
+            wav_file = mp3_file.replace(".mp3", ".wav")
+            audio = AudioSegment.from_mp3(mp3_file)
+            audio.export(wav_file, format="wav")
+            duration_sec = len(audio) / 1000.0
+            print(f"[TTS] WAV gerado, duração: {duration_sec:.2f}s")
+
+            # Reproduz com pygame
+            pygame.mixer.music.load(wav_file)
+            pygame.mixer.music.play()
+            time.sleep(duration_sec + 0.5)  # margem
+            print("[TTS] Reprodução concluída.")
+        except Exception as e:
+            print(f"[TTS] ERRO: {e}")
+            traceback.print_exc()
+        finally:
+            try:
+                pygame.mixer.music.stop()
+                pygame.mixer.music.unload()
+            except:
+                pass
+            for f in (mp3_file, wav_file):
+                if f and os.path.exists(f):
+                    try:
+                        os.unlink(f)
+                    except Exception as e:
+                        print(f"[TTS] Erro ao deletar {f}: {e}")
+            self.speaking = False
+
+    def speak_async(self, text):
+        if self.enabled and self._available:
+            print(f"[TTS] Adicionando à fila: {text[:50]}...")
+            self.queue.put(text)
+
+    def toggle(self):
+        self.enabled = not self.enabled
+        return self.enabled
 
 # =========================
 # SISTEMA DE VOZ
@@ -775,6 +883,8 @@ class AIEngine:
         self.url = base_url
         self.available = False
 
+        self.conversation_history = []
+        
         for ep in candidates:
             try:
                 if ep.endswith("/chat"):
@@ -795,27 +905,10 @@ class AIEngine:
                     break
             except Exception:
                 continue
-
-    def _build_messages(self, user_text: str, context: str = ""):
-        system = JARVIS_PERSONALITY
-        if context:
-            system += (
-                "\n\nUse o contexto fornecido como base principal para responder."
-                "\nSe o contexto não for suficiente, diga isso de forma direta."
-            )
-
-        user_payload = user_text
-        if context:
-            user_payload = (
-                "Contexto extraído da Wikipédia:\n"
-                f"{context}\n\n"
-                f"Pergunta do usuário:\n{user_text}"
-            )
-
-        return [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_payload}
-        ]
+    
+    def _trim_history(self, max_messages: int = 20):
+        if len(self.conversation_history) > max_messages:
+            self.conversation_history = self.conversation_history[-max_messages:]
 
     def _post_chat(self, messages, stream: bool = False, temperature: float = 0.7, timeout: int = 60):
         payload = {
@@ -873,7 +966,9 @@ class AIEngine:
             return {"action": "chat", "response": "Não consegui interpretar sua solicitação."}
 
     def decide(self, user_text):
-        messages = self._build_messages(user_text)
+        self.conversation_history.append({"role": "user", "content": user_text})
+
+        messages = [{"role": "system", "content": JARVIS_PERSONALITY}] + self.conversation_history
 
         try:
             r = self._post_chat(messages, stream=False, temperature=0.7, timeout=60)
@@ -888,6 +983,9 @@ class AIEngine:
             if not content:
                 content = "Resposta vazia do modelo."
 
+            self.conversation_history.append({"role": "assistant", "content": content})
+            self._trim_history()
+
             return {"action": "chat", "response": content}
 
         except Exception:
@@ -896,11 +994,25 @@ class AIEngine:
                 "response": "Não consegui interpretar sua solicitação."
             }
 
-    def stream_chat(self, user_text, on_token, context: str = ""):
-        messages = self._build_messages(user_text, context=context)
+    def stream_chat(self, user_text, on_token, context: str = "", timeout: int = 60):
+        self.conversation_history.append({"role": "user", "content": user_text})
+        
+        system_content = JARVIS_PERSONALITY
+        user_content = user_text
+        if context:
+            system_content += (
+                "\n\nUse o contexto fornecido como base principal para responder."
+                "\nSe o contexto não for suficiente, diga isso de forma direta."
+            )
+            user_content = f"Contexto extraído da Wikipédia:\n{context}\n\nPergunta do usuário:\n{user_text}"
 
+        messages = [{"role": "system", "content": system_content}] + self.conversation_history
+        if context:
+            messages[-1]["content"] = user_content
+
+        response_text = ""
         try:
-            with self._post_chat(messages, stream=True, temperature=0.7, timeout=60) as r:
+            with self._post_chat(messages, stream=True, temperature=0.7, timeout=timeout) as r:
                 r.raise_for_status()
                 for line in r.iter_lines():
                     if not line:
@@ -910,9 +1022,14 @@ class AIEngine:
                     except Exception:
                         token = ""
                     if token:
+                        response_text += token
                         on_token(token)
         except Exception as e:
             on_token(f"\n[Erro IA: {e}]")
+        if response_text:
+            self.conversation_history.append({"role": "assistant", "content": response_text})
+
+        self._trim_history()
 
 # =========================
 # COMMAND ROUTER (MODIFICADO PARA ADDONS)
@@ -2070,12 +2187,23 @@ class JarvisApp:
             bg=BG_COLOR,
             font=FONT_TITLE
         )
-        # keep reference to title and add a small status label for "pensando" animation
         self.title_label = title_label
         self.title_label.pack(side="left", padx=10)
         self.title_label.bind("<ButtonPress-1>", _start_move)
         self.title_label.bind("<B1-Motion>", _do_move)
         self.title_label.bind("<ButtonRelease-1>", _on_title_release)
+
+        # Botão TTS ao lado direito do título, antes dos status
+        self.tts_btn = tk.Label(
+            self.top_bar,
+            text="🔇",
+            fg=FG_COLOR,
+            bg=BG_COLOR,
+            font=("Consolas", 10),
+            cursor="hand2"
+        )
+        self.tts_btn.pack(side="left", padx=(8, 0))
+        self.tts_btn.bind("<Button-1>", lambda e: self._toggle_tts())
 
         self.status_label = tk.Label(
             self.top_bar,
@@ -2086,11 +2214,10 @@ class JarvisApp:
         )
         self.status_label.pack(side="left", padx=8)
 
-        # Novo label para status de gravação
         self.recording_label = tk.Label(
             self.top_bar,
             text="",
-            fg="#ff5555",  # Vermelho para indicar gravação
+            fg="#ff5555",
             bg=BG_COLOR,
             font=("Consolas", 10)
         )
@@ -2321,6 +2448,9 @@ class JarvisApp:
         # keep previous bindings/behavior
         self.entry.bind("<Return>", self.send)
         
+        self.tts = TTSEngine()
+        self.tts.start()
+        
         # AGORA inicializa o router (depois que a interface foi construída)
         self.router = CommandRouter(self)
         
@@ -2339,7 +2469,28 @@ class JarvisApp:
             self.say("JARVIS online. Apenas comandos.")
             if VOICE_AVAILABLE and self.voice_system:
                 self.say("Pressione CTRL+ALT+V para comandos por voz.")
+        
+        self._tts_buffer = ""
 
+    def _toggle_tts(self):
+        state = self.tts.toggle()
+        if state:
+            self.tts_btn.config(text="🔊")
+            print("[TTS] ATIVADO pelo usuário")
+        else:
+            self.tts_btn.config(text="🔇")
+            print("[TTS] DESATIVADO pelo usuário")
+        self.say(f"Voz {'ativada' if state else 'desativada'}.")
+    
+    def append_response_token(self, token):
+        self.chat.config(state="normal")
+        self.chat.insert("end", token)
+        self.chat.see("end")
+        self.chat.config(state="disabled")
+
+        if self.tts.enabled:
+            self._tts_buffer += token
+    
     # NOVO MÉTODO: Verifica se pode tentar reativar a IA
     def _should_try_reactivate_ai(self):
         """Retorna True apenas se a IA estava disponível inicialmente e agora não está"""
@@ -2427,60 +2578,44 @@ class JarvisApp:
         self._ai_cancelled = False
 
     def restore_from_tray_or_minimal(self):
-        """Restaura a janela se estiver na bandeja ou em presença mínima"""
-        # Se estiver na bandeja, restaura
+        """Restaura a janela se estiver na bandeja ou em presença mínima, 
+        mas não restaura se o TTS estiver ativo (evita maximizar durante fala)."""
+        
+        # Se TTS ativo e janela está na bandeja, não faz nada
+        if self.tts.enabled and hasattr(self, "_tray_icon") and self._tray_icon is not None:
+            return
+
         if hasattr(self, "_tray_icon") and self._tray_icon:
             try:
-                # Primeiro, para o ícone da bandeja
-                try:
-                    self._tray_icon.stop()
-                except:
-                    pass
-                self._tray_icon = None
-                
-                # Restaura a janela
-                self.root.deiconify()
-                self.root.attributes("-topmost", True)
-                self.root.overrideredirect(True)
-                self.root.lift()
-                self.root.focus_force()
-                
-                # Retoma tarefas de background
-                self.resume_background_tasks()
-                
-                # IMPORTANTE: Reconecta com o Ollama APENAS se estava disponível inicialmente
-                if self._ai_initially_available:
-                    self._reconnect_ollama()
-                
-                print("[JARVIS] Janela restaurada da bandeja.")
-                
-            except Exception as e:
-                print(f"[JARVIS] Erro ao restaurar da bandeja: {e}")
-                try:
-                    self.root.deiconify()
-                    self.root.attributes("-topmost", True)
-                    self.root.lift()
-                    self.root.focus_force()
-                    if self._ai_initially_available:
-                        self._reconnect_ollama()
-                except:
-                    pass
-        
-        # Se estiver em presença mínima, sai
-        if self._presence_minimal:
+                self._tray_icon.stop()
+            except:
+                pass
+            self._tray_icon = None
+
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+            self.root.overrideredirect(True)
+            self.root.lift()
+            self.root.focus_force()
+            self.resume_background_tasks()
+
+            if self._ai_initially_available:
+                self._reconnect_ollama()
+
+            print("[JARVIS] Janela restaurada da bandeja.")
+
+        elif self._presence_minimal:
             try:
                 self._exit_minimal_presence()
                 print("[JARVIS] Saindo do modo presença mínima.")
             except Exception as e:
                 print(f"[JARVIS] Erro ao sair do modo presença mínima: {e}")
-        
-        # Traz para frente e foca
+
         try:
             self.root.attributes("-topmost", True)
             self.root.lift()
             self.root.focus_force()
             self.entry.focus_set()
-            print("[JARVIS] Janela focada.")
         except Exception as e:
             print(f"[JARVIS] Erro ao focar janela: {e}")
 
@@ -2666,13 +2801,13 @@ class JarvisApp:
         self.chat.see("end")
         self.chat.config(state="disabled")
 
-    def append_response_token(self, token):
-        self.chat.config(state="normal")
-        self.chat.insert("end", token)
-        self.chat.see("end")
-        self.chat.config(state="disabled")
-
     def end_response_stream(self):
+        # Envia texto completo ao TTS, se ativado
+        if self.tts.enabled and self._tts_buffer.strip():
+            print(f"[TTS] Enviando texto completo: {self._tts_buffer.strip()[:80]}...")
+            self.tts.speak_async(self._tts_buffer.strip())
+        self._tts_buffer = ""
+
         self.chat.config(state="normal")
         self.chat.insert("end", "\n")
         self.chat.see("end")
@@ -2815,9 +2950,15 @@ class JarvisApp:
 
             context = ""
             if action == "research":
+                # Mensagem de feedback
+                mensagem_pesquisa = "Um momento por favor, vou pesquisar mais informações."
+                self.root.after(0, lambda: self.say(mensagem_pesquisa))
+                if self.tts.enabled:
+                    self.tts.speak_async(mensagem_pesquisa)
+
                 query = (plan.get("query") or plan.get("context_query") or text).strip()
                 self.root.after(0, self.start_thinking)
-                self.root.after(0, self.restore_from_tray_or_minimal)
+                self.root.after(0, self.restore_from_tray_or_minimal)  # não restaura se TTS ativo
                 time.sleep(0.3)
                 self.root.after(0, self.start_response_stream)
 
@@ -2830,6 +2971,7 @@ class JarvisApp:
                         pass
                     return True
 
+                context = ""
                 try:
                     if self.knowledge_provider and self.knowledge_provider.has_context():
                         kb = self.knowledge_provider.find_wikipedia_context(query)
@@ -2852,7 +2994,8 @@ class JarvisApp:
                     context = ""
 
                 try:
-                    self.ai.stream_chat(text, on_token, context=context)
+                    # Timeout dobrado para contextos grandes
+                    self.ai.stream_chat(text, on_token, context=context, timeout=120)
                     streamed = True
                 except Exception as e:
                     print(f"[JARVIS][AI] Erro ao responder com contexto: {e}")
@@ -2970,6 +3113,9 @@ class JarvisApp:
         self.chat.config(state="normal")
         self.chat.delete("1.0", "end")
         self.chat.config(state="disabled")
+        self.ai.conversation_history = []
+        self.stop_thinking()
+        self._tts_buffer = ""
 
     def run(self):
         self.root.mainloop()
